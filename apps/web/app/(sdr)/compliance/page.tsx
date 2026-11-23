@@ -1,27 +1,15 @@
 import { getServerSession } from "@nexus/identity-and-access";
-import { getComplianceStats, listSuppressionsByOrg } from "@/lib/sdr/suppression";
-import { addSuppressionDomainAction, uploadSuppressionCsvAction } from "./actions";
-
-function getOrganizationId(session: unknown): string {
-  const candidate = session as { organizationId?: string; user?: { organizationId?: string; email?: string } };
-  return candidate?.organizationId || candidate?.user?.organizationId || "";
-}
-
-function getSenderEmail(session: unknown): string {
-  const candidate = session as { user?: { email?: string } };
-  return candidate?.user?.email || "sender@yourcompany.com";
-}
+import { getActiveOrganizationContext } from "@nexus/organizations-and-teams";
+import { getSuppressionStats, listSuppressions, SUPPRESSION_REASONS } from "@/lib/sdr/suppression";
+import { addDomainSuppressionAction, uploadSuppressionCsvAction } from "./actions";
 
 export default async function CompliancePage({
   searchParams,
 }: {
-  searchParams?: { reason?: string; q?: string };
+  searchParams?: { reason?: string };
 }): Promise<JSX.Element> {
   const session = await getServerSession();
-  const organizationId = getOrganizationId(session);
-  const senderEmail = getSenderEmail(session);
-
-  if (!organizationId) {
+  if (!session?.user?.id) {
     return (
       <main>
         <h1>Compliance</h1>
@@ -30,75 +18,79 @@ export default async function CompliancePage({
     );
   }
 
-  const reason = searchParams?.reason || "";
-  const query = searchParams?.q || "";
+  const org = await getActiveOrganizationContext({ userId: session.user.id });
+  if (!org?.organizationId) {
+    return (
+      <main>
+        <h1>Compliance</h1>
+        <p>No active organization selected.</p>
+      </main>
+    );
+  }
 
+  const reason = searchParams?.reason?.trim() || "";
   const [stats, suppressions] = await Promise.all([
-    getComplianceStats(organizationId),
-    listSuppressionsByOrg({ organizationId, reason: reason || undefined, query: query || undefined }),
+    getSuppressionStats(org.organizationId),
+    listSuppressions(org.organizationId, reason || undefined),
   ]);
+
+  const senderAddress = process.env.SDR_SENDER_ADDRESS ?? "founder@example.com";
 
   return (
     <main>
-      <h1>Compliance</h1>
-      <p>Manage do-not-contact rules, honor unsubscribes immediately, and enforce US-only outreach.</p>
+      <h1>Compliance & Suppression</h1>
+      <p>Honor opt-outs immediately, enforce US-only outreach, and keep your do-not-contact ledger audit-ready.</p>
 
-      <section className="toolbar">
-        <div className="card">
-          <strong>{stats.suppressedContacts}</strong>
-          <p className="muted">Suppressed contacts</p>
-        </div>
-        <div className="card">
-          <strong>{stats.unsubscribesThisMonth}</strong>
-          <p className="muted">Unsubscribes honored this month</p>
-        </div>
-        <div className="card">
-          <strong>{stats.medianHonorSeconds}s</strong>
-          <p className="muted">Median time-to-honor</p>
-        </div>
+      <section className="toolbar" style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 12 }}>
+        <article className="card">
+          <h2>Suppressed contacts</h2>
+          <p><strong>{stats.suppressedContacts}</strong></p>
+        </article>
+        <article className="card">
+          <h2>Unsubscribes honored this month</h2>
+          <p><strong>{stats.unsubscribesHonoredThisMonth}</strong></p>
+        </article>
+        <article className="card">
+          <h2>Median time-to-honor</h2>
+          <p><strong>{stats.medianTimeToHonorSeconds}s</strong></p>
+        </article>
       </section>
 
       <section className="card">
         <h2>Sender footer address</h2>
-        <p className="muted">This address appears in every sequence footer:</p>
-        <p>
-          <code>{senderEmail}</code>
-        </p>
+        <p className="muted">This address appears in every outbound footer.</p>
+        <p><strong>{senderAddress}</strong></p>
       </section>
 
       <section className="card">
-        <h2>Add blocked domain</h2>
-        <form action={addSuppressionDomainAction}>
-          <label htmlFor="domain">Domain</label>
-          <input id="domain" name="domain" type="text" placeholder="example.com" required />
-          <button type="submit">Add domain</button>
+        <h2>Upload do-not-contact CSV</h2>
+        <form action={uploadSuppressionCsvAction}>
+          <label htmlFor="csv_text">CSV contents</label>
+          <textarea id="csv_text" name="csv_text" rows={8} placeholder="email&#10;jane@acme.com&#10;ops@globex.com" required />
+          <button type="submit">Upload suppression CSV</button>
         </form>
       </section>
 
       <section className="card">
-        <h2>Upload suppression CSV</h2>
-        <p className="muted">Paste one email or domain per line (comma-separated accepted).</p>
-        <form action={uploadSuppressionCsvAction}>
-          <label htmlFor="csv">CSV content</label>
-          <textarea id="csv" name="csv" rows={8} placeholder="alice@example.com&#10;blocked.com" />
-          <button type="submit">Import list</button>
+        <h2>Add suppressed domain</h2>
+        <form action={addDomainSuppressionAction}>
+          <label htmlFor="domain">Domain</label>
+          <input id="domain" name="domain" placeholder="example.com" required />
+          <button type="submit">Add domain suppression</button>
         </form>
       </section>
 
       <section>
         <h2>Suppression ledger</h2>
-        <form className="toolbar" method="GET">
-          <input type="text" name="q" placeholder="Search email or domain" defaultValue={query} />
-          <select name="reason" defaultValue={reason}>
+        <form className="toolbar" method="get">
+          <label htmlFor="reason">Reason</label>
+          <select id="reason" name="reason" defaultValue={reason}>
             <option value="">All reasons</option>
-            <option value="unsubscribe_link">unsubscribe_link</option>
-            <option value="unsubscribe_reply">unsubscribe_reply</option>
-            <option value="legal_threat">legal_threat</option>
-            <option value="manual">manual</option>
-            <option value="bounce_hard">bounce_hard</option>
-            <option value="customer_upload">customer_upload</option>
+            {SUPPRESSION_REASONS.map((r) => (
+              <option key={r} value={r}>{r}</option>
+            ))}
           </select>
-          <button type="submit">Search</button>
+          <button type="submit">Filter</button>
         </form>
 
         {suppressions.length === 0 ? (
@@ -118,12 +110,10 @@ export default async function CompliancePage({
             <tbody>
               {suppressions.map((row) => (
                 <tr key={row.id}>
-                  <td>{new Date(row.created_at).toLocaleString()}</td>
-                  <td>{row.email || "—"}</td>
-                  <td>{row.domain || "—"}</td>
-                  <td>
-                    <span className="card">{row.reason}</span>
-                  </td>
+                  <td>{new Date(row.createdAt).toLocaleString()}</td>
+                  <td>{row.email ?? "—"}</td>
+                  <td>{row.domain ?? "—"}</td>
+                  <td><span className="card" style={{ padding: "0.15rem 0.45rem" }}>{row.reason}</span></td>
                 </tr>
               ))}
             </tbody>

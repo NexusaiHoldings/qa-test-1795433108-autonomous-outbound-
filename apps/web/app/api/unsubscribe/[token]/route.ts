@@ -1,42 +1,45 @@
 import { NextRequest, NextResponse } from "next/server";
-import { hashToken, verifyUnsubscribeToken } from "@/lib/sdr/unsubscribe-token";
-import { recordUnsubscribeEvent, upsertSuppression } from "@/lib/sdr/suppression";
+import { addSuppression, recordUnsubscribeEvent } from "@/lib/sdr/suppression";
+import { verifyUnsubscribeToken } from "@/lib/sdr/unsubscribe-token";
 
-export async function GET(request: NextRequest, context: { params: { token: string } }): Promise<NextResponse> {
-  const { token } = context.params;
+function getClientIp(req: NextRequest): string | null {
+  const forwarded = req.headers.get("x-forwarded-for");
+  if (forwarded) {
+    const [first] = forwarded.split(",");
+    return first?.trim() ?? null;
+  }
+  return req.headers.get("x-real-ip");
+}
 
-  try {
-    const payload = verifyUnsubscribeToken(token);
-    const ipAddress = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? null;
-    const userAgent = request.headers.get("user-agent") ?? null;
+export async function GET(req: NextRequest, context: { params: { token: string } }): Promise<NextResponse> {
+  const token = context.params.token;
+  const verification = verifyUnsubscribeToken(token);
 
-    await recordUnsubscribeEvent({
-      tokenHash: hashToken(token),
-      ipAddress,
-      userAgent,
-    });
+  const ipAddress = getClientIp(req);
+  const userAgent = req.headers.get("user-agent");
 
-    await upsertSuppression({
-      organizationId: payload.orgId,
-      email: payload.email,
-      reason: "unsubscribe_link",
-      sourceMessageId: payload.messageId ?? null,
-    });
+  await recordUnsubscribeEvent({
+    tokenHash: verification.tokenHash,
+    ipAddress,
+    userAgent,
+  });
 
+  if (!verification.valid || !verification.payload) {
     return new NextResponse(
-      `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Unsubscribed</title></head><body><main><h1>You're unsubscribed</h1><p>You will not receive further outreach emails from this sender.</p></main></body></html>`,
-      {
-        status: 200,
-        headers: { "content-type": "text/html; charset=utf-8" },
-      },
-    );
-  } catch {
-    return new NextResponse(
-      `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Invalid link</title></head><body><main><h1>Unsubscribe link invalid or expired</h1><p>Please reply directly to the email and we will honor your request manually.</p></main></body></html>`,
-      {
-        status: 400,
-        headers: { "content-type": "text/html; charset=utf-8" },
-      },
+      "<html><body><main><h1>Unsubscribe link invalid</h1><p>This link is invalid or expired.</p></main></body></html>",
+      { status: 400, headers: { "content-type": "text/html; charset=utf-8" } },
     );
   }
+
+  await addSuppression({
+    organizationId: verification.payload.organizationId,
+    email: verification.payload.email,
+    reason: "unsubscribe_link",
+    sourceMessageId: verification.payload.messageId ?? null,
+  });
+
+  return new NextResponse(
+    "<html><body><main><h1>You’re unsubscribed</h1><p>We’ve added you to this sender’s suppression list immediately.</p></main></body></html>",
+    { status: 200, headers: { "content-type": "text/html; charset=utf-8" } },
+  );
 }

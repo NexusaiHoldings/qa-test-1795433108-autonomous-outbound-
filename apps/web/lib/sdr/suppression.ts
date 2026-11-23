@@ -1,33 +1,32 @@
-import { randomUUID } from "node:crypto";
-import { Pool } from "pg";
+import { randomUUID } from "crypto";
+import { sql } from "@vercel/postgres";
 
-export type SuppressionReason =
-  | "unsubscribe_link"
-  | "unsubscribe_reply"
-  | "legal_threat"
-  | "manual"
-  | "bounce_hard"
-  | "customer_upload";
+export const SUPPRESSION_REASONS = [
+  "unsubscribe_link",
+  "unsubscribe_reply",
+  "legal_threat",
+  "manual",
+  "bounce_hard",
+  "customer_upload",
+] as const;
+
+export type SuppressionReason = (typeof SUPPRESSION_REASONS)[number];
 
 export type SuppressionRecord = {
   id: string;
-  organization_id: string;
+  organizationId: string;
   email: string | null;
   domain: string | null;
   reason: SuppressionReason;
-  source_message_id: string | null;
-  created_at: string;
+  sourceMessageId: string | null;
+  createdAt: string;
 };
 
-export type ComplianceStats = {
+export type SuppressionStats = {
   suppressedContacts: number;
-  unsubscribesThisMonth: number;
-  medianHonorSeconds: number;
+  unsubscribesHonoredThisMonth: number;
+  medianTimeToHonorSeconds: number;
 };
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-});
 
 function normalizeEmail(email: string): string {
   return email.trim().toLowerCase();
@@ -37,151 +36,191 @@ function normalizeDomain(domain: string): string {
   return domain.trim().toLowerCase().replace(/^@/, "");
 }
 
-export async function upsertSuppression(input: {
+function reasonFromText(input: string): SuppressionReason {
+  if ((SUPPRESSION_REASONS as readonly string[]).includes(input)) {
+    return input as SuppressionReason;
+  }
+  return "manual";
+}
+
+export async function addSuppression(params: {
   organizationId: string;
   email?: string | null;
   domain?: string | null;
   reason: SuppressionReason;
   sourceMessageId?: string | null;
-  createdAt?: Date;
 }): Promise<SuppressionRecord> {
-  const email = input.email ? normalizeEmail(input.email) : null;
-  const domain = input.domain ? normalizeDomain(input.domain) : null;
-
+  const email = params.email ? normalizeEmail(params.email) : null;
+  const domain = params.domain ? normalizeDomain(params.domain) : null;
   if (!email && !domain) {
     throw new Error("Either email or domain is required for suppression");
   }
 
-  const client = await pool.connect();
-  try {
-    const existing = await client.query<SuppressionRecord>(
-      `SELECT id, organization_id, email, domain, reason, source_message_id, created_at::text
-       FROM sdr_suppressions
-       WHERE organization_id = $1
-         AND (
-          ($2::text IS NOT NULL AND email = $2)
-          OR ($3::text IS NOT NULL AND domain = $3)
-         )
-       ORDER BY created_at ASC
-       LIMIT 1`,
-      [input.organizationId, email, domain],
-    );
+  const existing = await sql<{
+    id: string;
+    organization_id: string;
+    email: string | null;
+    domain: string | null;
+    reason: string;
+    source_message_id: string | null;
+    created_at: string;
+  }>`
+    SELECT id, organization_id, email, domain, reason, source_message_id, created_at
+    FROM sdr_suppressions
+    WHERE organization_id = ${params.organizationId}
+      AND (
+        (${email}::text IS NOT NULL AND email = ${email})
+        OR
+        (${domain}::text IS NOT NULL AND domain = ${domain})
+      )
+    ORDER BY created_at DESC
+    LIMIT 1
+  `;
 
-    if (existing.rows.length > 0) {
-      return existing.rows[0];
-    }
-
-    const id = randomUUID();
-    const createdAt = input.createdAt ?? new Date();
-    const inserted = await client.query<SuppressionRecord>(
-      `INSERT INTO sdr_suppressions (
-          id, organization_id, email, domain, reason, source_message_id, created_at
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING id, organization_id, email, domain, reason, source_message_id, created_at::text`,
-      [id, input.organizationId, email, domain, input.reason, input.sourceMessageId ?? null, createdAt.toISOString()],
-    );
-
-    return inserted.rows[0];
-  } finally {
-    client.release();
+  if (existing.rows.length > 0) {
+    const row = existing.rows[0];
+    return {
+      id: row.id,
+      organizationId: row.organization_id,
+      email: row.email,
+      domain: row.domain,
+      reason: reasonFromText(row.reason),
+      sourceMessageId: row.source_message_id,
+      createdAt: row.created_at,
+    };
   }
+
+  const id = randomUUID();
+  const inserted = await sql<{
+    id: string;
+    organization_id: string;
+    email: string | null;
+    domain: string | null;
+    reason: string;
+    source_message_id: string | null;
+    created_at: string;
+  }>`
+    INSERT INTO sdr_suppressions (id, organization_id, email, domain, reason, source_message_id)
+    VALUES (${id}, ${params.organizationId}, ${email}, ${domain}, ${params.reason}, ${params.sourceMessageId ?? null})
+    RETURNING id, organization_id, email, domain, reason, source_message_id, created_at
+  `;
+
+  const row = inserted.rows[0];
+  return {
+    id: row.id,
+    organizationId: row.organization_id,
+    email: row.email,
+    domain: row.domain,
+    reason: reasonFromText(row.reason),
+    sourceMessageId: row.source_message_id,
+    createdAt: row.created_at,
+  };
 }
 
-export async function recordUnsubscribeEvent(input: {
+export async function recordUnsubscribeEvent(params: {
   tokenHash: string;
   ipAddress: string | null;
   userAgent: string | null;
-  eventTimestamp?: Date;
 }): Promise<void> {
-  await pool.query(
-    `INSERT INTO sdr_unsubscribe_events (id, token_hash, ip_address, user_agent, event_timestamp)
-     VALUES ($1, $2, $3, $4, $5)`,
-    [
-      randomUUID(),
-      input.tokenHash,
-      input.ipAddress,
-      input.userAgent,
-      (input.eventTimestamp ?? new Date()).toISOString(),
-    ],
-  );
-}
-
-export async function listSuppressionsByOrg(params: {
-  organizationId: string;
-  reason?: string;
-  query?: string;
-  limit?: number;
-}): Promise<SuppressionRecord[]> {
-  const values: Array<string | number | null> = [params.organizationId];
-  const clauses: string[] = [`organization_id = $1`];
-
-  if (params.reason) {
-    values.push(params.reason);
-    clauses.push(`reason = $${values.length}`);
-  }
-
-  if (params.query) {
-    const q = `%${params.query.toLowerCase()}%`;
-    values.push(q);
-    clauses.push(`(LOWER(COALESCE(email, '')) LIKE $${values.length} OR LOWER(COALESCE(domain, '')) LIKE $${values.length})`);
-  }
-
-  values.push(params.limit ?? 200);
-
-  const sql = `
-    SELECT id, organization_id, email, domain, reason, source_message_id, created_at::text
-    FROM sdr_suppressions
-    WHERE ${clauses.join(" AND ")}
-    ORDER BY created_at DESC
-    LIMIT $${values.length}
+  await sql`
+    INSERT INTO sdr_unsubscribe_events (id, token_hash, ip_address, user_agent)
+    VALUES (${randomUUID()}, ${params.tokenHash}, ${params.ipAddress}, ${params.userAgent})
   `;
-
-  const result = await pool.query<SuppressionRecord>(sql, values);
-  return result.rows;
 }
 
-export async function getComplianceStats(organizationId: string): Promise<ComplianceStats> {
-  const [suppressedResult, unsubscribedResult, medianResult] = await Promise.all([
-    pool.query<{ count: string }>(
-      `SELECT COUNT(*)::text AS count
-       FROM sdr_suppressions
-       WHERE organization_id = $1`,
-      [organizationId],
-    ),
-    pool.query<{ count: string }>(
-      `SELECT COUNT(*)::text AS count
-       FROM sdr_suppressions
-       WHERE organization_id = $1
-         AND reason = 'unsubscribe_link'
-         AND date_trunc('month', created_at) = date_trunc('month', NOW())`,
-      [organizationId],
-    ),
-    pool.query<{ median_seconds: string | null }>(
-      `WITH ev AS (
-         SELECT token_hash, MIN(event_timestamp) AS event_ts
-         FROM sdr_unsubscribe_events
-         GROUP BY token_hash
-       ),
-       sup AS (
-         SELECT created_at, encode(digest(organization_id::text || ':' || email, 'sha256'), 'hex') AS k
-         FROM sdr_suppressions
-         WHERE organization_id = $1
-           AND reason = 'unsubscribe_link'
-           AND email IS NOT NULL
-       )
-       SELECT
-         percentile_cont(0.5) WITHIN GROUP (
-           ORDER BY EXTRACT(EPOCH FROM (sup.created_at - ev.event_ts))
-         )::text AS median_seconds
-       FROM sup
-       JOIN ev ON ev.token_hash = sup.k`,
-      [organizationId],
-    ),
+export async function listSuppressions(organizationId: string, reason?: string): Promise<SuppressionRecord[]> {
+  const query = reason
+    ? sql<{
+        id: string;
+        organization_id: string;
+        email: string | null;
+        domain: string | null;
+        reason: string;
+        source_message_id: string | null;
+        created_at: string;
+      }>`
+        SELECT id, organization_id, email, domain, reason, source_message_id, created_at
+        FROM sdr_suppressions
+        WHERE organization_id = ${organizationId} AND reason = ${reason}
+        ORDER BY created_at DESC
+      `
+    : sql<{
+        id: string;
+        organization_id: string;
+        email: string | null;
+        domain: string | null;
+        reason: string;
+        source_message_id: string | null;
+        created_at: string;
+      }>`
+        SELECT id, organization_id, email, domain, reason, source_message_id, created_at
+        FROM sdr_suppressions
+        WHERE organization_id = ${organizationId}
+        ORDER BY created_at DESC
+      `;
+
+  const result = await query;
+  return result.rows.map((row) => ({
+    id: row.id,
+    organizationId: row.organization_id,
+    email: row.email,
+    domain: row.domain,
+    reason: reasonFromText(row.reason),
+    sourceMessageId: row.source_message_id,
+    createdAt: row.created_at,
+  }));
+}
+
+export async function getSuppressionStats(organizationId: string): Promise<SuppressionStats> {
+  const [suppressedResult, unsubThisMonthResult, medianResult] = await Promise.all([
+    sql<{ count: string }>`
+      SELECT COUNT(*)::text AS count
+      FROM sdr_suppressions
+      WHERE organization_id = ${organizationId}
+    `,
+    sql<{ count: string }>`
+      SELECT COUNT(*)::text AS count
+      FROM sdr_suppressions
+      WHERE organization_id = ${organizationId}
+        AND reason IN ('unsubscribe_link', 'unsubscribe_reply')
+        AND created_at >= date_trunc('month', now())
+    `,
+    sql<{ median_seconds: string | null }>`
+      WITH linked AS (
+        SELECT
+          EXTRACT(EPOCH FROM (s.created_at - m.sent_at)) AS seconds_diff
+        FROM sdr_suppressions s
+        JOIN sdr_messages m ON m.id = s.source_message_id
+        WHERE s.organization_id = ${organizationId}
+          AND s.reason IN ('unsubscribe_link', 'unsubscribe_reply')
+          AND m.sent_at IS NOT NULL
+          AND s.created_at >= date_trunc('month', now())
+      )
+      SELECT
+        CASE WHEN COUNT(*) = 0 THEN NULL ELSE percentile_cont(0.5) WITHIN GROUP (ORDER BY seconds_diff)::text END AS median_seconds
+      FROM linked
+    `,
   ]);
 
   return {
-    suppressedContacts: Number(suppressedResult.rows[0]?.count ?? 0),
-    unsubscribesThisMonth: Number(unsubscribedResult.rows[0]?.count ?? 0),
-    medianHonorSeconds: Math.max(0, Math.round(Number(medianResult.rows[0]?.median_seconds ?? 0))),
+    suppressedContacts: Number(suppressedResult.rows[0]?.count ?? "0"),
+    unsubscribesHonoredThisMonth: Number(unsubThisMonthResult.rows[0]?.count ?? "0"),
+    medianTimeToHonorSeconds: Math.round(Number(medianResult.rows[0]?.median_seconds ?? "0")),
   };
+}
+
+export function parseCsvEmails(csvText: string): string[] {
+  const lines = csvText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const emails = new Set<string>();
+
+  for (const line of lines) {
+    const parts = line.split(",").map((part) => part.trim().replace(/^"|"$/g, ""));
+    for (const part of parts) {
+      if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(part)) {
+        emails.add(normalizeEmail(part));
+      }
+    }
+  }
+
+  return [...emails];
 }

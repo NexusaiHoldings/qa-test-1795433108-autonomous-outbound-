@@ -1,78 +1,79 @@
-import crypto from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "crypto";
 
 export type UnsubscribeTokenPayload = {
-  orgId: string;
+  organizationId: string;
   email: string;
   messageId?: string;
   exp: number;
 };
 
-const DEFAULT_TTL_SECONDS = 60 * 60 * 24 * 365;
-const SECRET = process.env.SDR_UNSUBSCRIBE_SECRET || process.env.NEXTAUTH_SECRET || "";
+const TOKEN_VERSION = "v1";
 
-function base64urlEncode(input: Buffer | string): string {
-  return Buffer.from(input)
-    .toString("base64")
-    .replaceAll("+", "-")
-    .replaceAll("/", "_")
-    .replaceAll("=", "");
+function getSecret(): string {
+  const secret = process.env.SDR_UNSUBSCRIBE_SECRET;
+  if (!secret) {
+    throw new Error("Missing SDR_UNSUBSCRIBE_SECRET environment variable");
+  }
+  return secret;
 }
 
-function base64urlDecode(input: string): Buffer {
-  const normalized = input.replaceAll("-", "+").replaceAll("_", "/");
-  const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
-  return Buffer.from(padded, "base64");
+function toBase64Url(value: string): string {
+  return Buffer.from(value, "utf8").toString("base64url");
 }
 
-function ensureSecret(): void {
-  if (!SECRET) {
-    throw new Error("Missing SDR_UNSUBSCRIBE_SECRET or NEXTAUTH_SECRET");
-  }
+function fromBase64Url(value: string): string {
+  return Buffer.from(value, "base64url").toString("utf8");
 }
 
-export function signUnsubscribeToken(
-  payload: Omit<UnsubscribeTokenPayload, "exp"> & { exp?: number },
-): string {
-  ensureSecret();
-  const fullPayload: UnsubscribeTokenPayload = {
-    ...payload,
-    exp: payload.exp ?? Math.floor(Date.now() / 1000) + DEFAULT_TTL_SECONDS,
-  };
-  const payloadJson = JSON.stringify(fullPayload);
-  const payloadB64 = base64urlEncode(payloadJson);
-  const signature = crypto.createHmac("sha256", SECRET).update(payloadB64).digest();
-  const signatureB64 = base64urlEncode(signature);
-  return `${payloadB64}.${signatureB64}`;
+function signData(payloadB64: string, secret: string): string {
+  return createHmac("sha256", secret).update(payloadB64).digest("base64url");
 }
 
-export function hashToken(token: string): string {
-  return crypto.createHash("sha256").update(token).digest("hex");
+export function createUnsubscribeToken(payload: UnsubscribeTokenPayload): string {
+  const secret = getSecret();
+  const serialized = JSON.stringify(payload);
+  const payloadB64 = toBase64Url(serialized);
+  const sig = signData(payloadB64, secret);
+  return `${TOKEN_VERSION}.${payloadB64}.${sig}`;
 }
 
-export function verifyUnsubscribeToken(token: string): UnsubscribeTokenPayload {
-  ensureSecret();
-  const [payloadB64, signatureB64] = token.split(".");
-  if (!payloadB64 || !signatureB64) {
-    throw new Error("Invalid token format");
+export function verifyUnsubscribeToken(token: string): {
+  valid: boolean;
+  payload: UnsubscribeTokenPayload | null;
+  tokenHash: string;
+  error?: string;
+} {
+  const tokenHash = createHash("sha256").update(token).digest("hex");
+  const parts = token.split(".");
+  if (parts.length !== 3) {
+    return { valid: false, payload: null, tokenHash, error: "malformed_token" };
   }
 
-  const expectedSig = crypto.createHmac("sha256", SECRET).update(payloadB64).digest();
-  const actualSig = base64urlDecode(signatureB64);
-
-  if (expectedSig.length !== actualSig.length || !crypto.timingSafeEqual(expectedSig, actualSig)) {
-    throw new Error("Invalid token signature");
+  const [version, payloadB64, sig] = parts;
+  if (version !== TOKEN_VERSION || !payloadB64 || !sig) {
+    return { valid: false, payload: null, tokenHash, error: "invalid_token_format" };
   }
 
-  const payloadRaw = base64urlDecode(payloadB64).toString("utf8");
-  const payload = JSON.parse(payloadRaw) as UnsubscribeTokenPayload;
+  const secret = getSecret();
+  const expectedSig = signData(payloadB64, secret);
 
-  if (!payload.orgId || !payload.email || !payload.exp) {
-    throw new Error("Invalid token payload");
+  const sigBuffer = Buffer.from(sig, "utf8");
+  const expectedBuffer = Buffer.from(expectedSig, "utf8");
+  if (sigBuffer.length !== expectedBuffer.length || !timingSafeEqual(sigBuffer, expectedBuffer)) {
+    return { valid: false, payload: null, tokenHash, error: "invalid_signature" };
   }
 
-  if (Math.floor(Date.now() / 1000) > payload.exp) {
-    throw new Error("Token expired");
+  try {
+    const payloadRaw = fromBase64Url(payloadB64);
+    const payload = JSON.parse(payloadRaw) as UnsubscribeTokenPayload;
+    if (!payload.organizationId || !payload.email || !payload.exp) {
+      return { valid: false, payload: null, tokenHash, error: "invalid_payload" };
+    }
+    if (Date.now() > payload.exp * 1000) {
+      return { valid: false, payload: null, tokenHash, error: "expired_token" };
+    }
+    return { valid: true, payload, tokenHash };
+  } catch {
+    return { valid: false, payload: null, tokenHash, error: "invalid_payload_json" };
   }
-
-  return payload;
 }
