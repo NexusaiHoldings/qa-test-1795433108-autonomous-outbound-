@@ -1,57 +1,67 @@
 "use server";
 
-import { addSuppression, parseCsvEmails } from "@/lib/sdr/suppression";
-import { getServerSession } from "@nexus/identity-and-access";
-import { getActiveOrganizationContext } from "@nexus/organizations-and-teams";
+import { redirect } from "next/navigation";
+import { revalidatePath } from "next/cache";
+import { getSessionUser } from "@/lib/admin-auth";
+import {
+  addSuppression,
+  getActiveOrganizationId,
+  parseCsvEmails,
+} from "@/lib/sdr/suppression";
 
-export async function addDomainSuppressionAction(formData: FormData): Promise<{ ok: boolean; error?: string }> {
-  const session = await getServerSession();
-  if (!session?.user?.id) {
-    return { ok: false, error: "Unauthorized" };
+async function resolveOrgOrRedirect(): Promise<string> {
+  const user = await getSessionUser();
+  if (!user?.id) {
+    redirect("/compliance?status=unauthorized");
   }
+  const organizationId = await getActiveOrganizationId(user.id);
+  if (!organizationId) {
+    redirect("/compliance?status=no_org");
+  }
+  return organizationId;
+}
 
-  const org = await getActiveOrganizationContext({ userId: session.user.id });
-  if (!org?.organizationId) {
-    return { ok: false, error: "No active organization" };
-  }
+export async function addDomainSuppressionAction(formData: FormData): Promise<void> {
+  const organizationId = await resolveOrgOrRedirect();
 
   const domainRaw = String(formData.get("domain") ?? "").trim();
   if (!domainRaw) {
-    return { ok: false, error: "Domain is required" };
+    redirect("/compliance?status=domain_required");
   }
 
   await addSuppression({
-    organizationId: org.organizationId,
+    organizationId,
     domain: domainRaw,
     reason: "manual",
   });
 
-  return { ok: true };
+  revalidatePath("/compliance");
+  redirect("/compliance?status=domain_added");
 }
 
-export async function uploadSuppressionCsvAction(formData: FormData): Promise<{ ok: boolean; added: number; error?: string }> {
-  const session = await getServerSession();
-  if (!session?.user?.id) {
-    return { ok: false, added: 0, error: "Unauthorized" };
+export async function uploadSuppressionCsvAction(formData: FormData): Promise<void> {
+  const organizationId = await resolveOrgOrRedirect();
+
+  // Accept either pasted CSV text or an uploaded CSV file. Files are uploaded
+  // via @nexus/files-and-media in production; here we also decode the raw bytes
+  // so the action works end-to-end without a storage round-trip.
+  let text = String(formData.get("csv_text") ?? "");
+  const file = formData.get("csv_file");
+  if (!text && file && typeof file === "object" && "arrayBuffer" in file) {
+    text = Buffer.from(await (file as Blob).arrayBuffer()).toString("utf8");
   }
 
-  const org = await getActiveOrganizationContext({ userId: session.user.id });
-  if (!org?.organizationId) {
-    return { ok: false, added: 0, error: "No active organization" };
-  }
-
-  const text = String(formData.get("csv_text") ?? "");
   const emails = parseCsvEmails(text);
   let added = 0;
-
   for (const email of emails) {
     await addSuppression({
-      organizationId: org.organizationId,
+      organizationId,
       email,
       reason: "customer_upload",
     });
     added += 1;
   }
 
-  return { ok: true, added };
+  revalidatePath("/compliance");
+  redirect(`/compliance?status=csv_uploaded&added=${added}`);
 }
