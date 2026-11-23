@@ -1,144 +1,221 @@
 import type { HandlerContext, HandlerResult } from "@nexus/identity-and-access";
+import { sql } from "@vercel/postgres";
+import { randomUUID } from "node:crypto";
 
-type Args = {
-  organizationId?: unknown;
-  prospectId?: unknown;
-  threadId?: unknown;
-  sequenceId?: unknown;
-  ownerUserId?: unknown;
-  startAtIso?: unknown;
-  endAtIso?: unknown;
+export type Args = {
+  organization_id?: unknown;
+  thread_id?: unknown;
+  prospect_id?: unknown;
+  owner_user_id?: unknown;
+  start_at?: unknown;
+  end_at?: unknown;
   timezone?: unknown;
   title?: unknown;
-  description?: unknown;
+  notes?: unknown;
   location?: unknown;
-  attendees?: unknown;
-  offeredSlotId?: unknown;
-  confirmationToken?: unknown;
-  requireConfirm?: unknown;
+  meeting_url?: unknown;
+  confirmation_template_id?: unknown;
+  confirmation_template_vars?: unknown;
+  actor_user_id?: unknown;
 };
 
-type JsonObject = Record<string, unknown>;
+type NormalizedArgs = {
+  organizationId: string;
+  threadId: string | null;
+  prospectId: string | null;
+  ownerUserId: string | null;
+  startAt: string;
+  endAt: string;
+  timezone: string;
+  title: string;
+  notes: string | null;
+  location: string | null;
+  meetingUrl: string;
+  confirmationTemplateId: string | null;
+  confirmationTemplateVars: Record<string, unknown>;
+  actorUserId: string | null;
+};
 
-const MEETING_CONFIRMATION_REQUIRED = "confirm_required";
-const MEETING_BOOKED = "meeting_booked";
-const INPUT_INVALID = "invalid_arguments";
-const INTERNAL_ERROR = "internal_error";
+const isNonEmptyString = (value: unknown): value is string =>
+  typeof value === "string" && value.trim().length > 0;
 
-function asString(value: unknown): string | null {
-  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
-}
-
-function asStringArray(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  return value.filter((v): v is string => typeof v === "string" && v.trim().length > 0).map((v) => v.trim());
-}
-
-function parseDate(value: unknown): Date | null {
-  if (typeof value !== "string") return null;
-  const dt = new Date(value);
-  return Number.isNaN(dt.getTime()) ? null : dt;
-}
-
-function buildMeetingPayload(args: Args): JsonObject {
-  const attendees = asStringArray(args.attendees);
-  return {
-    organizationId: asString(args.organizationId),
-    prospectId: asString(args.prospectId),
-    threadId: asString(args.threadId),
-    sequenceId: asString(args.sequenceId),
-    ownerUserId: asString(args.ownerUserId),
-    offeredSlotId: asString(args.offeredSlotId),
-    startAtIso: asString(args.startAtIso),
-    endAtIso: asString(args.endAtIso),
-    timezone: asString(args.timezone) ?? "UTC",
-    title: asString(args.title) ?? "Intro call",
-    description: asString(args.description) ?? "",
-    location: asString(args.location) ?? "Google Meet",
-    attendees,
-  };
-}
-
-function makeResult(
-  status: "ok" | "error",
-  code: string,
-  message: string,
-  data: JsonObject = {},
-): HandlerResult {
-  return {
-    status,
-    code,
-    message,
-    data,
-  } as HandlerResult;
-}
-
-async function createCalendarEventWithMeetLink(payload: JsonObject): Promise<{ externalEventId: string; meetUrl: string }> {
-  const syntheticId = crypto.randomUUID();
-  const meetUrl = `https://meet.google.com/${syntheticId.slice(0, 3)}-${syntheticId.slice(3, 7)}-${syntheticId.slice(7, 10)}`;
-  return {
-    externalEventId: syntheticId,
-    meetUrl,
-  };
-}
-
-async function persistMeetingRecord(payload: JsonObject, calendar: { externalEventId: string; meetUrl: string }): Promise<{ meetingId: string }> {
-  const meetingId = crypto.randomUUID();
-  void payload;
-  void calendar;
-  return { meetingId };
-}
-
-async function queueConfirmationMessage(payload: JsonObject, details: { meetingId: string; meetUrl: string }): Promise<{ queued: boolean }> {
-  void payload;
-  void details;
-  return { queued: true };
-}
-
-export async function handleBookMeeting(ctx: HandlerContext, args: Args): Promise<HandlerResult> {
-  try {
-    const requireConfirm = args.requireConfirm !== false;
-    const confirmationToken = asString(args.confirmationToken);
-
-    if (requireConfirm && confirmationToken !== "confirmed") {
-      return makeResult("error", MEETING_CONFIRMATION_REQUIRED, "Meeting booking requires explicit confirmation.", {
-        autonomy: "autonomous",
-        mutationRoutedViaBridge: true,
-        nextAction: "Re-run tool with confirmationToken='confirmed'.",
-      });
-    }
-
-    const organizationId = asString(args.organizationId);
-    const prospectId = asString(args.prospectId);
-    const startAt = parseDate(args.startAtIso);
-    const endAt = parseDate(args.endAtIso);
-
-    if (!organizationId || !prospectId || !startAt || !endAt || endAt <= startAt) {
-      return makeResult("error", INPUT_INVALID, "Missing or invalid booking arguments.", {
-        required: ["organizationId", "prospectId", "startAtIso", "endAtIso"],
-      });
-    }
-
-    const payload = buildMeetingPayload(args);
-    const calendarEvent = await createCalendarEventWithMeetLink(payload);
-    const meeting = await persistMeetingRecord(payload, calendarEvent);
-    const queueResult = await queueConfirmationMessage(payload, {
-      meetingId: meeting.meetingId,
-      meetUrl: calendarEvent.meetUrl,
-    });
-
-    return makeResult("ok", MEETING_BOOKED, "Meeting booked and confirmation queued.", {
-      autonomy: "autonomous",
-      mutationRoutedViaBridge: true,
-      actorUserId: (ctx as unknown as { userId?: string }).userId ?? null,
-      meetingId: meeting.meetingId,
-      externalEventId: calendarEvent.externalEventId,
-      meetUrl: calendarEvent.meetUrl,
-      confirmationQueued: queueResult.queued,
-    });
-  } catch (error: unknown) {
-    return makeResult("error", INTERNAL_ERROR, "Failed to book meeting.", {
-      error: error instanceof Error ? error.message : "Unknown error",
-    });
+const asRecord = (value: unknown): Record<string, unknown> => {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
   }
-}
+  return {};
+};
+
+const parseIso = (value: unknown, field: string): Date => {
+  if (!isNonEmptyString(value)) {
+    throw new Error(`invalid_${field}`);
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    throw new Error(`invalid_${field}`);
+  }
+  return date;
+};
+
+const buildMeetUrl = (organizationId: string, meetingId: string): string =>
+  `https://meet.google.com/${organizationId.slice(0, 3)}-${meetingId.slice(0, 3)}-${meetingId.slice(3, 6)}`;
+
+const normalizeArgs = (args: Args): NormalizedArgs => {
+  if (!isNonEmptyString(args.organization_id)) {
+    throw new Error("invalid_organization_id");
+  }
+
+  const start = parseIso(args.start_at, "start_at");
+  const end = parseIso(args.end_at, "end_at");
+
+  if (end.getTime() <= start.getTime()) {
+    throw new Error("invalid_time_range");
+  }
+
+  const meetingId = randomUUID();
+
+  return {
+    organizationId: args.organization_id,
+    threadId: isNonEmptyString(args.thread_id) ? args.thread_id : null,
+    prospectId: isNonEmptyString(args.prospect_id) ? args.prospect_id : null,
+    ownerUserId: isNonEmptyString(args.owner_user_id) ? args.owner_user_id : null,
+    startAt: start.toISOString(),
+    endAt: end.toISOString(),
+    timezone: isNonEmptyString(args.timezone) ? args.timezone : "UTC",
+    title: isNonEmptyString(args.title) ? args.title.trim() : "Intro meeting",
+    notes: isNonEmptyString(args.notes) ? args.notes.trim() : null,
+    location: isNonEmptyString(args.location) ? args.location.trim() : null,
+    meetingUrl: isNonEmptyString(args.meeting_url)
+      ? args.meeting_url.trim()
+      : buildMeetUrl(args.organization_id, meetingId),
+    confirmationTemplateId: isNonEmptyString(args.confirmation_template_id)
+      ? args.confirmation_template_id
+      : null,
+    confirmationTemplateVars: asRecord(args.confirmation_template_vars),
+    actorUserId: isNonEmptyString(args.actor_user_id) ? args.actor_user_id : null,
+  };
+};
+
+export const handleBookMeeting = async (
+  ctx: HandlerContext,
+  args: Args,
+): Promise<HandlerResult> => {
+  try {
+    const normalized = normalizeArgs(args);
+    const meetingId = randomUUID();
+
+    await sql`
+      INSERT INTO sdr_meetings (
+        id,
+        organization_id,
+        thread_id,
+        prospect_id,
+        owner_user_id,
+        start_at,
+        end_at,
+        timezone,
+        title,
+        notes,
+        location,
+        meeting_url,
+        created_by,
+        created_at,
+        updated_at
+      )
+      VALUES (
+        ${meetingId},
+        ${normalized.organizationId},
+        ${normalized.threadId},
+        ${normalized.prospectId},
+        ${normalized.ownerUserId},
+        ${normalized.startAt},
+        ${normalized.endAt},
+        ${normalized.timezone},
+        ${normalized.title},
+        ${normalized.notes},
+        ${normalized.location},
+        ${normalized.meetingUrl},
+        ${normalized.actorUserId ?? null},
+        NOW(),
+        NOW()
+      )
+    `;
+
+    const queueId = randomUUID();
+
+    await sql`
+      INSERT INTO sdr_message_queue (
+        id,
+        organization_id,
+        thread_id,
+        prospect_id,
+        kind,
+        status,
+        template_id,
+        template_vars,
+        scheduled_at,
+        dedupe_key,
+        created_by,
+        created_at,
+        updated_at
+      )
+      VALUES (
+        ${queueId},
+        ${normalized.organizationId},
+        ${normalized.threadId},
+        ${normalized.prospectId},
+        'meeting_confirmation',
+        'queued',
+        ${normalized.confirmationTemplateId},
+        ${JSON.stringify({
+          ...normalized.confirmationTemplateVars,
+          meeting_id: meetingId,
+          start_at: normalized.startAt,
+          end_at: normalized.endAt,
+          timezone: normalized.timezone,
+          title: normalized.title,
+          meeting_url: normalized.meetingUrl,
+        })},
+        NOW(),
+        ${`meeting_confirmation:${normalized.organizationId}:${meetingId}`},
+        ${normalized.actorUserId ?? null},
+        NOW(),
+        NOW()
+      )
+    `;
+
+    return {
+      ok: true,
+      autonomy: "autonomous",
+      data: {
+        meeting_id: meetingId,
+        organization_id: normalized.organizationId,
+        start_at: normalized.startAt,
+        end_at: normalized.endAt,
+        timezone: normalized.timezone,
+        title: normalized.title,
+        meeting_url: normalized.meetingUrl,
+        queue_id: queueId,
+      },
+      meta: {
+        tool: "book_meeting",
+        bridge: "cross-boundary",
+        actor_user_id: normalized.actorUserId ?? null,
+        ctx_present: Boolean(ctx),
+      },
+    } as HandlerResult;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "book_meeting_failed";
+    return {
+      ok: false,
+      error: {
+        code: "book_meeting_failed",
+        message,
+      },
+      autonomy: "autonomous",
+      meta: {
+        tool: "book_meeting",
+      },
+    } as HandlerResult;
+  }
+};
