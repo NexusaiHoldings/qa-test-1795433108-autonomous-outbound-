@@ -25,6 +25,7 @@
 
 import type { HandlerContext, HandlerResult } from "@nexus/identity-and-access";
 import { handleEnqueueReplyForHumanReview } from "./enqueue_reply_for_human_review";
+import { handleBookMeeting } from "./book_meeting";
 
 type Args = Record<string, unknown>;
 
@@ -34,4 +35,6 @@ export const DOMAIN_DISPATCH: Record<
 > = {
   // Build agent appends entries here per CTO-declared new_domain_tool.
   enqueue_reply_for_human_review: (ctx, a) => handleEnqueueReplyForHumanReview(ctx, a),
+  book_meeting: (ctx, a) => handleBookMeeting(ctx, a),
 };
+
