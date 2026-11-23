@@ -244,4 +244,74 @@ CREATE INDEX IF NOT EXISTS sdr_send_events_org_idx ON sdr_send_events(organizati
 CREATE INDEX IF NOT EXISTS sdr_send_events_mailbox_idx ON sdr_send_events(mailbox_id, occurred_at DESC);
 CREATE INDEX IF NOT EXISTS sdr_send_events_message_idx ON sdr_send_events(message_id);
 CREATE INDEX IF NOT EXISTS sdr_send_events_event_idx ON sdr_send_events(organization_id, event);
+
+-- F1-007: Reply Classifier + Conversation Engine.
+-- The ingest cron polls each connected mailbox's Gmail history every 5 minutes.
+-- These columns persist the poll cursor (Gmail historyId) + last-polled stamp so
+-- subsequent polls only process new inbound mail. ALTER ... IF NOT EXISTS keeps
+-- the F1-006 sdr_mailboxes table forward-compatible without a destructive rewrite.
+ALTER TABLE sdr_mailboxes ADD COLUMN IF NOT EXISTS last_history_id TEXT;
+ALTER TABLE sdr_mailboxes ADD COLUMN IF NOT EXISTS last_polled_at TIMESTAMPTZ;
+
+-- F1-007: every inbound reply matched to an sdr_messages thread. One row per
+-- distinct inbound provider message. classification is the few-shot enum
+-- (interested | soft_objection | hard_no | out_of_office | wrong_person |
+-- unsubscribe | legal_threat | unclear); confidence is the model's 0-1 score;
+-- extracted_datetime is the prospect-confirmed slot parsed out of an "interested"
+-- reply; handled_by records who resolved it (agent | customer | operator). Free-form
+-- text columns carry NO CHECK constraint (enum values are enforced in app code).
+CREATE TABLE IF NOT EXISTS sdr_replies (
+  id UUID PRIMARY KEY,
+  organization_id UUID NOT NULL,
+  campaign_id UUID REFERENCES sdr_campaigns(id) ON DELETE SET NULL,
+  prospect_id UUID REFERENCES sdr_prospects(id) ON DELETE SET NULL,
+  sequence_id UUID,
+  message_id UUID REFERENCES sdr_messages(id) ON DELETE SET NULL,
+  mailbox_id UUID,
+  thread_ref TEXT,
+  provider TEXT NOT NULL DEFAULT 'gmail',
+  provider_message_id TEXT,
+  from_email TEXT,
+  subject TEXT,
+  body_text TEXT,
+  received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  classification TEXT NOT NULL DEFAULT 'unclear',
+  confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
+  classifier_source TEXT NOT NULL DEFAULT 'fallback',
+  reasoning TEXT,
+  extracted_datetime TIMESTAMPTZ,
+  handled_by TEXT NOT NULL DEFAULT 'agent',
+  action_taken TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS sdr_replies_org_idx ON sdr_replies(organization_id);
+CREATE INDEX IF NOT EXISTS sdr_replies_org_prospect_idx ON sdr_replies(organization_id, prospect_id);
+CREATE INDEX IF NOT EXISTS sdr_replies_org_class_idx ON sdr_replies(organization_id, classification);
+CREATE INDEX IF NOT EXISTS sdr_replies_thread_idx ON sdr_replies(organization_id, thread_ref);
+CREATE INDEX IF NOT EXISTS sdr_replies_received_idx ON sdr_replies(organization_id, received_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS sdr_replies_provider_msg_uniq
+  ON sdr_replies(organization_id, provider_message_id);
+
+-- F1-007: the human review queue. scope routes an escalation to the customer
+-- (the founder — soft judgment calls, low-confidence replies) or an operator
+-- (Nexus staff — legal threats, abuse). status is open | resolved.
+CREATE TABLE IF NOT EXISTS sdr_review_queue (
+  id UUID PRIMARY KEY,
+  organization_id UUID NOT NULL,
+  reply_id UUID REFERENCES sdr_replies(id) ON DELETE CASCADE,
+  prospect_id UUID REFERENCES sdr_prospects(id) ON DELETE SET NULL,
+  scope TEXT NOT NULL DEFAULT 'customer',
+  reason TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open',
+  resolved_by UUID,
+  resolution_note TEXT,
+  resolved_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS sdr_review_queue_org_idx ON sdr_review_queue(organization_id);
+CREATE INDEX IF NOT EXISTS sdr_review_queue_org_status_idx ON sdr_review_queue(organization_id, status);
+CREATE INDEX IF NOT EXISTS sdr_review_queue_org_scope_idx ON sdr_review_queue(organization_id, scope, status);
+CREATE INDEX IF NOT EXISTS sdr_review_queue_reply_idx ON sdr_review_queue(reply_id);
 `;
