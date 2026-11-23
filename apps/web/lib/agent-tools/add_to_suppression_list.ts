@@ -1,232 +1,183 @@
-import { randomUUID } from "crypto";
 import type { HandlerContext, HandlerResult } from "@nexus/identity-and-access";
 import { sql } from "@vercel/postgres";
 
 type Args = {
-  organization_id?: unknown;
-  mailbox_id?: unknown;
-  email?: unknown;
-  domain?: unknown;
-  reason?: unknown;
-  source?: unknown;
-  actor_user_id?: unknown;
-  actor_type?: unknown;
+  organization_id?: string;
+  organizationId?: string;
+  email?: string;
+  domain?: string;
+  reason?: string;
+  source?: string;
+  actor_user_id?: string;
+  actorUserId?: string;
+  touch_statuses_to_cancel?: string[];
 };
 
-type Target =
-  | { kind: "email"; value: string }
+type ParsedTarget =
+  | { kind: "email"; value: string; domain: string }
   | { kind: "domain"; value: string };
 
-const EMAIL_REGEX =
-  /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/i;
+const DOMAIN_RE = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i;
 
-function normalizeString(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  const trimmed: string = value.trim();
-  return trimmed.length > 0 ? trimmed : null;
+function toErrorResult(code: string, message: string): HandlerResult {
+  return {
+    ok: false,
+    code,
+    message,
+  } as HandlerResult;
 }
 
-function normalizeEmail(email: string): string | null {
-  const normalized: string = email.trim().toLowerCase();
-  if (!EMAIL_REGEX.test(normalized)) return null;
-  return normalized;
+function toSuccessResult(data: Record<string, unknown>): HandlerResult {
+  return {
+    ok: true,
+    ...data,
+  } as HandlerResult;
 }
 
-function normalizeDomain(domain: string): string | null {
-  let d: string = domain.trim().toLowerCase();
-  d = d.replace(/^https?:\/\//, "");
-  d = d.replace(/^www\./, "");
-  d = d.split("/")[0] ?? d;
-  d = d.split("?")[0] ?? d;
-  d = d.split("#")[0] ?? d;
-  d = d.replace(/\.$/, "");
-  if (!d || d.includes("@")) return null;
-  if (!/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(d)) return null;
-  return d;
-}
+function parseTarget(emailRaw: unknown, domainRaw: unknown): ParsedTarget | null {
+  const email = typeof emailRaw === "string" ? emailRaw.trim().toLowerCase() : "";
+  const domain = typeof domainRaw === "string" ? domainRaw.trim().toLowerCase() : "";
 
-function parseTarget(args: Args): Target | null {
-  const emailRaw: string | null = normalizeString(args.email);
-  const domainRaw: string | null = normalizeString(args.domain);
-
-  if (emailRaw) {
-    const email: string | null = normalizeEmail(emailRaw);
-    if (!email) return null;
-    return { kind: "email", value: email };
+  if (email.length > 0) {
+    if (!EMAIL_RE.test(email)) {
+      return null;
+    }
+    const emailDomain = email.split("@")[1] ?? "";
+    return { kind: "email", value: email, domain: emailDomain };
   }
 
-  if (domainRaw) {
-    const domain: string | null = normalizeDomain(domainRaw);
-    if (!domain) return null;
-    return { kind: "domain", value: domain };
+  if (domain.length > 0) {
+    const normalized = domain.startsWith("@") ? domain.slice(1) : domain;
+    if (!DOMAIN_RE.test(normalized)) {
+      return null;
+    }
+    return { kind: "domain", value: normalized };
   }
 
   return null;
 }
 
-function success(payload: Record<string, unknown>): HandlerResult {
-  return {
-    ok: true,
-    data: payload,
-  } as HandlerResult;
+function normalizeReason(reasonRaw: unknown): string {
+  if (typeof reasonRaw !== "string") {
+    return "unspecified";
+  }
+  const normalized = reasonRaw.trim().toLowerCase();
+  return normalized.length > 0 ? normalized : "unspecified";
 }
 
-function failure(
-  code: string,
-  message: string,
-  details?: Record<string, unknown>,
-): HandlerResult {
-  return {
-    ok: false,
-    error: {
-      code,
-      message,
-      ...(details ? { details } : {}),
-    },
-  } as HandlerResult;
+function normalizeSource(sourceRaw: unknown): string {
+  if (typeof sourceRaw !== "string") {
+    return "agent_tool";
+  }
+  const normalized = sourceRaw.trim().toLowerCase();
+  return normalized.length > 0 ? normalized : "agent_tool";
 }
 
 export async function handleAddToSuppressionList(
-  ctx: HandlerContext,
+  _ctx: HandlerContext,
   args: Args,
 ): Promise<HandlerResult> {
+  const organizationId = args.organization_id ?? args.organizationId;
+  if (!organizationId || typeof organizationId !== "string") {
+    return toErrorResult("invalid_args", "organization_id is required");
+  }
+
+  const target = parseTarget(args.email, args.domain);
+  if (!target) {
+    return toErrorResult("invalid_args", "Provide a valid email or domain");
+  }
+
+  const reason = normalizeReason(args.reason);
+  const source = normalizeSource(args.source);
+  const actorUserId =
+    typeof args.actor_user_id === "string"
+      ? args.actor_user_id
+      : typeof args.actorUserId === "string"
+        ? args.actorUserId
+        : null;
+
+  const cancellationStatuses =
+    Array.isArray(args.touch_statuses_to_cancel) && args.touch_statuses_to_cancel.length > 0
+      ? args.touch_statuses_to_cancel.filter((s): s is string => typeof s === "string")
+      : ["queued", "scheduled", "pending", "approved"];
+
   try {
-    const organizationId: string | null = normalizeString(args.organization_id);
-    if (!organizationId) {
-      return failure("invalid_arguments", "organization_id is required");
-    }
-
-    const target: Target | null = parseTarget(args);
-    if (!target) {
-      return failure(
-        "invalid_arguments",
-        "Either a valid email or a valid domain is required",
-      );
-    }
-
-    const reason: string =
-      normalizeString(args.reason) ??
-      "unspecified_unsubscribe_or_deliverability_event";
-    const source: string =
-      normalizeString(args.source) ?? "agent_tool_add_to_suppression_list";
-    const mailboxId: string | null = normalizeString(args.mailbox_id);
-    const actorUserId: string | null = normalizeString(args.actor_user_id);
-    const actorType: string = normalizeString(args.actor_type) ?? "system";
-
-    const suppressionId: string = randomUUID();
-    const nowIso: string = new Date().toISOString();
-
-    let upserted;
-    if (target.kind === "email") {
-      upserted = await sql`
-        INSERT INTO sdr_suppressions (
-          id,
-          organization_id,
-          mailbox_id,
-          email,
-          domain,
-          reason,
-          source,
-          actor_user_id,
-          actor_type,
-          created_at,
-          updated_at
-        )
-        VALUES (
-          ${suppressionId},
-          ${organizationId},
-          ${mailboxId},
-          ${target.value},
-          NULL,
-          ${reason},
-          ${source},
-          ${actorUserId},
-          ${actorType},
-          ${nowIso},
-          ${nowIso}
-        )
-        ON CONFLICT (organization_id, email)
-        DO UPDATE SET
-          mailbox_id = COALESCE(EXCLUDED.mailbox_id, sdr_suppressions.mailbox_id),
-          reason = EXCLUDED.reason,
-          source = EXCLUDED.source,
-          actor_user_id = EXCLUDED.actor_user_id,
-          actor_type = EXCLUDED.actor_type,
-          updated_at = EXCLUDED.updated_at
-        RETURNING id, organization_id, mailbox_id, email, domain, reason, source, actor_user_id, actor_type, created_at, updated_at
-      `;
-    } else {
-      upserted = await sql`
-        INSERT INTO sdr_suppressions (
-          id,
-          organization_id,
-          mailbox_id,
-          email,
-          domain,
-          reason,
-          source,
-          actor_user_id,
-          actor_type,
-          created_at,
-          updated_at
-        )
-        VALUES (
-          ${suppressionId},
-          ${organizationId},
-          ${mailboxId},
-          NULL,
-          ${target.value},
-          ${reason},
-          ${source},
-          ${actorUserId},
-          ${actorType},
-          ${nowIso},
-          ${nowIso}
-        )
-        ON CONFLICT (organization_id, domain)
-        DO UPDATE SET
-          mailbox_id = COALESCE(EXCLUDED.mailbox_id, sdr_suppressions.mailbox_id),
-          reason = EXCLUDED.reason,
-          source = EXCLUDED.source,
-          actor_user_id = EXCLUDED.actor_user_id,
-          actor_type = EXCLUDED.actor_type,
-          updated_at = EXCLUDED.updated_at
-        RETURNING id, organization_id, mailbox_id, email, domain, reason, source, actor_user_id, actor_type, created_at, updated_at
-      `;
-    }
-
-    const canceled = await sql`
-      UPDATE sdr_sequence_touches
-      SET
-        status = 'canceled',
-        cancellation_reason = 'suppressed',
-        updated_at = ${nowIso}
-      WHERE
-        organization_id = ${organizationId}
-        AND status IN ('queued', 'scheduled', 'pending')
-        AND (
-          (${target.kind === "email"} AND lower(prospect_email) = ${
-            target.kind === "email" ? target.value : ""
-          })
-          OR
-          (${target.kind === "domain"} AND lower(prospect_domain) = ${
-            target.kind === "domain" ? target.value : ""
-          })
-        )
-      RETURNING id
+    const suppressionInsert = await sql`
+      INSERT INTO sdr_suppressions (
+        id,
+        organization_id,
+        email,
+        domain,
+        reason,
+        source,
+        actor_user_id,
+        created_at,
+        updated_at
+      )
+      VALUES (
+        gen_random_uuid(),
+        ${organizationId},
+        ${target.kind === "email" ? target.value : null},
+        ${target.kind === "domain" ? target.value : null},
+        ${reason},
+        ${source},
+        ${actorUserId},
+        NOW(),
+        NOW()
+      )
+      ON CONFLICT (organization_id, COALESCE(email, ''), COALESCE(domain, ''))
+      DO UPDATE SET
+        reason = EXCLUDED.reason,
+        source = EXCLUDED.source,
+        actor_user_id = EXCLUDED.actor_user_id,
+        updated_at = NOW()
+      RETURNING id, organization_id, email, domain, reason, source, actor_user_id, created_at, updated_at
     `;
 
-    return success({
-      suppression: upserted.rows[0] ?? null,
-      canceled_touch_count: canceled.rowCount ?? 0,
-      target_kind: target.kind,
-      target_value: target.value,
+    let canceledTouches = 0;
+
+    if (target.kind === "email") {
+      const cancelByEmail = await sql`
+        UPDATE sdr_touches
+        SET status = 'canceled',
+            canceled_reason = ${`suppressed:${reason}`},
+            canceled_at = NOW(),
+            updated_at = NOW()
+        WHERE organization_id = ${organizationId}
+          AND lower(prospect_email) = ${target.value}
+          AND status = ANY(${cancellationStatuses}::text[])
+      `;
+      canceledTouches += cancelByEmail.rowCount ?? 0;
+    }
+
+    const domainForCancel = target.kind === "domain" ? target.value : target.domain;
+    if (domainForCancel) {
+      const cancelByDomain = await sql`
+        UPDATE sdr_touches
+        SET status = 'canceled',
+            canceled_reason = ${`suppressed:${reason}`},
+            canceled_at = NOW(),
+            updated_at = NOW()
+        WHERE organization_id = ${organizationId}
+          AND lower(split_part(prospect_email, '@', 2)) = ${domainForCancel}
+          AND status = ANY(${cancellationStatuses}::text[])
+      `;
+      canceledTouches += cancelByDomain.rowCount ?? 0;
+    }
+
+    const suppression = suppressionInsert.rows[0] ?? null;
+    return toSuccessResult({
+      tool: "add_to_suppression_list",
+      organization_id: organizationId,
+      suppression,
+      canceled_touches: canceledTouches,
+      target: target.kind === "email" ? { email: target.value } : { domain: target.value },
     });
   } catch (error: unknown) {
-    return failure("internal_error", "Failed to add suppression", {
-      message: error instanceof Error ? error.message : "unknown_error",
-      tool: "add_to_suppression_list",
-      has_ctx: Boolean(ctx),
-    });
+    return toErrorResult(
+      "internal_error",
+      error instanceof Error ? error.message : "failed to add suppression",
+    );
   }
 }

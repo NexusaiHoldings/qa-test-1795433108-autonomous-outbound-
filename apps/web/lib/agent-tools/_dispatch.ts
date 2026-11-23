@@ -41,4 +41,3 @@ export const DOMAIN_DISPATCH: Record<
   pause_mailbox_sending: (ctx, a) => handlePauseMailboxSending(ctx, a),
   add_to_suppression_list: (ctx, a) => handleAddToSuppressionList(ctx, a),
 };
-
