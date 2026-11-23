@@ -1,5 +1,41 @@
 import { randomUUID } from "node:crypto";
-import { Pool } from "pg";
+
+interface PgQueryResult {
+  rows: Record<string, unknown>[];
+  rowCount: number;
+}
+
+interface PgPoolClient {
+  query: (sql: string, params?: unknown[]) => Promise<PgQueryResult>;
+  release: () => void;
+}
+
+interface PgPool {
+  query: (sql: string, params?: unknown[]) => Promise<PgQueryResult>;
+  connect: () => Promise<PgPoolClient>;
+}
+
+let _pool: PgPool | null = null;
+
+/**
+ * Lazily construct a singleton `pg` pool. `pg` is externalized in
+ * next.config.js (serverComponentsExternalPackages), so a runtime require
+ * resolves it from the serverless function's node_modules and it is never
+ * bundled for the client — matching the substrate's @/lib/db pattern.
+ */
+function getPool(): PgPool {
+  if (_pool) return _pool;
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { Pool } = require("pg") as {
+    Pool: new (config: Record<string, unknown>) => PgPool;
+  };
+  _pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    max: 10,
+    idleTimeoutMillis: 30_000,
+  });
+  return _pool;
+}
 
 export type ReviewQueueReason = "unclear" | "low_confidence" | "legal_threat";
 export type ReviewClassification =
@@ -58,10 +94,6 @@ export interface ResolveReviewInput {
   notes: string | null;
 }
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-});
-
 function rowToQueueItem(row: Record<string, unknown>): ReviewQueueItem {
   return {
     id: String(row.id),
@@ -85,7 +117,7 @@ export async function listOpenReviewQueue(
   organizationId: string,
   limit = 100,
 ): Promise<{ items: ReviewQueueItem[]; autoHandledToday: number }> {
-  const client = await pool.connect();
+  const client = await getPool().connect();
   try {
     const queueResult = await client.query(
       `
@@ -137,7 +169,7 @@ export async function getReviewThreadById(
   organizationId: string,
   reviewId: string,
 ): Promise<ReviewThreadDetail | null> {
-  const client = await pool.connect();
+  const client = await getPool().connect();
   try {
     const head = await client.query(
       `
@@ -221,7 +253,7 @@ export async function getReviewThreadById(
 }
 
 export async function resolveReview(input: ResolveReviewInput): Promise<{ ok: true }> {
-  const client = await pool.connect();
+  const client = await getPool().connect();
   try {
     await client.query("BEGIN");
 
