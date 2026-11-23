@@ -1,83 +1,97 @@
 import { redirect } from "next/navigation";
-import { getAdminUser } from "@nexus/admin-console";
-import { getReviewQueueItemById } from "@/lib/sdr/review-resolution";
+import { getAdminUser } from "@nexus/organizations-and-teams";
+import { getReviewThreadById } from "@/lib/sdr/review-resolution";
 
-export default async function ReviewQueueDetailPage({
-  params,
-}: {
+interface PageProps {
   params: { id: string };
-}): Promise<JSX.Element> {
+}
+
+const CLASS_OPTIONS = [
+  "positive_interest",
+  "not_interested",
+  "objection",
+  "unsubscribe",
+  "out_of_office",
+  "referral",
+  "legal_threat",
+] as const;
+
+const ACTION_OPTIONS = ["send_drafted_touch", "close", "suppress", "hand_to_customer"] as const;
+
+export default async function ReviewQueueDetailPage({ params }: PageProps): Promise<JSX.Element> {
   const admin = await getAdminUser();
-  if (!admin) redirect("/");
+  if (!admin) {
+    redirect("/");
+  }
 
-  const auth = { id: String(admin.id), organizationId: String(admin.organizationId), email: admin.email ?? null };
-  const item = await getReviewQueueItemById(auth, params.id);
+  const organizationId = String((admin as { organizationId?: string }).organizationId ?? "");
+  if (!organizationId) {
+    redirect("/");
+  }
 
-  if (!item) {
+  const detail = await getReviewThreadById(organizationId, params.id);
+  if (!detail) {
     return (
       <main>
-        <h1>Review item not found</h1>
-        <p className="muted">This queue entry may have been resolved already.</p>
+        <h1>Review not found</h1>
       </main>
     );
   }
 
   return (
     <main>
-      <h1>Review Queue Item</h1>
-      <p className="muted">Triage thread + classifier output, then resolve.</p>
+      <h1>Review queue item</h1>
+      <p>
+        Reason: <strong>{detail.reason}</strong> · Guess:{" "}
+        <strong>{detail.classifierGuess ?? "—"}</strong> · Confidence:{" "}
+        <strong>{detail.classifierConfidence !== null ? `${Math.round(detail.classifierConfidence * 100)}%` : "—"}</strong>
+      </p>
 
-      <div style={{ display: "grid", gridTemplateColumns: "1.1fr 2fr 1.4fr", gap: 12 }}>
-        <section className="card">
-          <h2>Queue Meta</h2>
-          <p><strong>Reason:</strong> <code>{item.reason}</code></p>
-          <p><strong>Status:</strong> {item.status}</p>
-          <p><strong>Guess:</strong> {item.classifierGuess ?? "n/a"}</p>
-          <p><strong>Confidence:</strong> {item.classifierConfidence?.toFixed(2) ?? "n/a"}</p>
-        </section>
+      <section className="card">
+        <h2>Thread</h2>
+        {detail.messages.map((message) => (
+          <article key={message.id} className="card">
+            <p>
+              <strong>{message.direction}</strong> · {message.sentAt ?? message.createdAt}
+            </p>
+            <p>
+              <strong>{message.subject ?? "(no subject)"}</strong>
+            </p>
+            <p>{message.bodyText ?? "—"}</p>
+          </article>
+        ))}
+      </section>
 
-        <section className="card">
-          <h2>Thread</h2>
-          <p><strong>Prospect:</strong> {item.prospectName ?? "Unknown"} ({item.prospectEmail ?? "no email"})</p>
-          <p><strong>Company:</strong> {item.companyName ?? "n/a"}</p>
-          <p><strong>Subject:</strong> {item.subject ?? "(no subject)"}</p>
-          <pre style={{ whiteSpace: "pre-wrap" }}>{item.bodyText ?? "(empty body)"}</pre>
-        </section>
+      <section className="card">
+        <h2>Decision</h2>
+        <form method="post" action={`/admin/api/review-queue/${detail.id}/resolve`}>
+          <label htmlFor="correctedClassification">Classification</label>
+          <select id="correctedClassification" name="correctedClassification" defaultValue={detail.classifierGuess ?? "objection"}>
+            {CLASS_OPTIONS.map((option) => (
+              <option key={option} value={option}>
+                {option}
+              </option>
+            ))}
+          </select>
 
-        <section className="card">
-          <h2>Decision</h2>
-          <form action={`/admin/api/review-queue/${item.id}/resolve`} method="post">
-            <label htmlFor="correctedClassification">Classification</label>
-            <select id="correctedClassification" name="correctedClassification" defaultValue="unclear">
-              <option value="interested">Interested</option>
-              <option value="not_interested">Not Interested</option>
-              <option value="objection">Objection</option>
-              <option value="legal_threat">Legal Threat</option>
-              <option value="unclear">Unclear</option>
-              <option value="meeting_request">Meeting Request</option>
-              <option value="unsubscribe">Unsubscribe</option>
-            </select>
+          <fieldset>
+            <legend>Action</legend>
+            {ACTION_OPTIONS.map((option) => (
+              <label key={option}>
+                <input type="radio" name="action" value={option} defaultChecked={option === "close"} />
+                {option}
+              </label>
+            ))}
+          </fieldset>
 
-            <label htmlFor="action">Action</label>
-            <select id="action" name="action" defaultValue="hand_to_customer">
-              <option value="send_drafted_touch">Send drafted touch</option>
-              <option value="close">Close</option>
-              <option value="suppress">Suppress</option>
-              <option value="hand_to_customer">Hand to customer</option>
-            </select>
+          <label htmlFor="notes">Notes</label>
+          <textarea id="notes" name="notes" rows={4} />
 
-            <label htmlFor="notes">Notes</label>
-            <textarea id="notes" name="notes" rows={6} placeholder="What did you decide and why?" />
+          <button type="submit">Resolve</button>
+        </form>
+      </section>
 
-            <button type="submit">Resolve</button>
-          </form>
-
-          <hr />
-          <p className="muted">
-            Keyboard: j/k navigate • 1-7 set classification/action • Enter resolve
-          </p>
-        </section>
-      </div>
+      <p className="muted">Shortcuts: j/k navigate queue • 1-7 classification</p>
     </main>
   );
 }

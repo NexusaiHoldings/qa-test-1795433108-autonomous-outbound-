@@ -251,28 +251,23 @@ CREATE INDEX IF NOT EXISTS sdr_send_events_event_idx ON sdr_send_events(organiza
 -- subsequent polls only process new inbound mail. ALTER ... IF NOT EXISTS keeps
 -- the F1-006 sdr_mailboxes table forwa
 
--- F1-010: operator review queue and decisions for low-confidence/edge-case replies.
 CREATE TABLE IF NOT EXISTS sdr_review_queue (
   id UUID PRIMARY KEY,
   organization_id UUID NOT NULL,
-  message_id UUID REFERENCES sdr_messages(id) ON DELETE SET NULL,
-  sequence_id UUID REFERENCES sdr_sequences(id) ON DELETE SET NULL,
-  prospect_id UUID REFERENCES sdr_prospects(id) ON DELETE SET NULL,
+  message_id UUID NOT NULL REFERENCES sdr_messages(id) ON DELETE CASCADE,
   reason TEXT NOT NULL,
   classifier_guess TEXT,
   classifier_confidence DOUBLE PRECISION,
-  classifier_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
   status TEXT NOT NULL DEFAULT 'open',
-  assigned_to_user_id UUID,
-  resolved_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  resolved_at TIMESTAMPTZ
 );
 
-CREATE INDEX IF NOT EXISTS sdr_review_queue_org_idx ON sdr_review_queue(organization_id);
-CREATE INDEX IF NOT EXISTS sdr_review_queue_org_status_idx ON sdr_review_queue(organization_id, status, created_at ASC);
-CREATE INDEX IF NOT EXISTS sdr_review_queue_org_reason_idx ON sdr_review_queue(organization_id, reason);
-CREATE INDEX IF NOT EXISTS sdr_review_queue_message_idx ON sdr_review_queue(message_id);
+CREATE INDEX IF NOT EXISTS sdr_review_queue_org_status_idx
+  ON sdr_review_queue(organization_id, status, created_at ASC);
+CREATE INDEX IF NOT EXISTS sdr_review_queue_message_idx
+  ON sdr_review_queue(message_id);
 
 CREATE TABLE IF NOT EXISTS sdr_review_decisions (
   id UUID PRIMARY KEY,
@@ -282,11 +277,11 @@ CREATE TABLE IF NOT EXISTS sdr_review_decisions (
   corrected_classification TEXT NOT NULL,
   action TEXT NOT NULL,
   notes TEXT,
-  decided_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  decided_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS sdr_review_decisions_org_idx ON sdr_review_decisions(organization_id);
-CREATE INDEX IF NOT EXISTS sdr_review_decisions_review_idx ON sdr_review_decisions(review_id, decided_at DESC);
-CREATE INDEX IF NOT EXISTS sdr_review_decisions_operator_idx ON sdr_review_decisions(operator_id, decided_at DESC);
+CREATE INDEX IF NOT EXISTS sdr_review_decisions_org_idx
+  ON sdr_review_decisions(organization_id, decided_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS sdr_review_decisions_review_uniq
+  ON sdr_review_decisions(review_id);
 `;

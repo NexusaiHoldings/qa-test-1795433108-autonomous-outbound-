@@ -1,165 +1,270 @@
-import { randomUUID } from "crypto";
+import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
 
-export type AdminUser = {
-  id: string;
-  organizationId: string;
-  email?: string | null;
-};
+export type ReviewQueueReason = "unclear" | "low_confidence" | "legal_threat";
+export type ReviewClassification =
+  | "positive_interest"
+  | "not_interested"
+  | "objection"
+  | "unsubscribe"
+  | "out_of_office"
+  | "referral"
+  | "legal_threat";
+export type ReviewAction = "send_drafted_touch" | "close" | "suppress" | "hand_to_customer";
 
-export type ReviewQueueItem = {
+export interface ReviewQueueItem {
   id: string;
-  organizationId: string;
-  messageId: string | null;
-  sequenceId: string | null;
-  prospectId: string | null;
-  reason: string;
-  classifierGuess: string | null;
+  messageId: string;
+  reason: ReviewQueueReason;
+  classifierGuess: ReviewClassification | null;
   classifierConfidence: number | null;
-  classifierPayload: Record<string, unknown>;
-  status: string;
-  assignedToUserId: string | null;
-  resolvedAt: string | null;
   createdAt: string;
-  updatedAt: string;
-  subject: string | null;
-  bodyText: string | null;
-  direction: string | null;
+  ageSeconds: number;
   prospectName: string | null;
   prospectEmail: string | null;
-  companyName: string | null;
-};
+  subject: string | null;
+  bodyText: string | null;
+}
 
-export type ResolveReviewInput = {
-  correctedClassification: string;
-  action: "send_drafted_touch" | "close" | "suppress" | "hand_to_customer";
+export interface ReviewThreadMessage {
+  id: string;
+  direction: string;
+  subject: string | null;
+  bodyText: string | null;
+  sentAt: string | null;
+  createdAt: string;
+}
+
+export interface ReviewThreadDetail {
+  id: string;
+  reason: ReviewQueueReason;
+  classifierGuess: ReviewClassification | null;
+  classifierConfidence: number | null;
+  createdAt: string;
+  ageSeconds: number;
+  messageId: string;
+  threadRef: string | null;
+  prospectName: string | null;
+  prospectEmail: string | null;
+  messages: ReviewThreadMessage[];
+}
+
+export interface ResolveReviewInput {
+  reviewId: string;
+  organizationId: string;
+  operatorId: string;
+  correctedClassification: ReviewClassification;
+  action: ReviewAction;
   notes: string | null;
-};
+}
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
 
-function mapQueueRow(row: Record<string, unknown>): ReviewQueueItem {
+function rowToQueueItem(row: Record<string, unknown>): ReviewQueueItem {
   return {
     id: String(row.id),
-    organizationId: String(row.organization_id),
-    messageId: row.message_id ? String(row.message_id) : null,
-    sequenceId: row.sequence_id ? String(row.sequence_id) : null,
-    prospectId: row.prospect_id ? String(row.prospect_id) : null,
-    reason: String(row.reason),
-    classifierGuess: row.classifier_guess ? String(row.classifier_guess) : null,
+    messageId: String(row.message_id),
+    reason: String(row.reason) as ReviewQueueReason,
+    classifierGuess: (row.classifier_guess as ReviewClassification | null) ?? null,
     classifierConfidence:
-      typeof row.classifier_confidence === "number" ? row.classifier_confidence : null,
-    classifierPayload:
-      row.classifier_payload && typeof row.classifier_payload === "object"
-        ? (row.classifier_payload as Record<string, unknown>)
-        : {},
-    status: String(row.status),
-    assignedToUserId: row.assigned_to_user_id ? String(row.assigned_to_user_id) : null,
-    resolvedAt: row.resolved_at ? String(row.resolved_at) : null,
+      row.classifier_confidence === null || row.classifier_confidence === undefined
+        ? null
+        : Number(row.classifier_confidence),
     createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-    subject: row.subject ? String(row.subject) : null,
-    bodyText: row.body_text ? String(row.body_text) : null,
-    direction: row.direction ? String(row.direction) : null,
-    prospectName: row.prospect_name ? String(row.prospect_name) : null,
-    prospectEmail: row.prospect_email ? String(row.prospect_email) : null,
-    companyName: row.company_name ? String(row.company_name) : null,
+    ageSeconds: Number(row.age_seconds ?? 0),
+    prospectName: (row.prospect_name as string | null) ?? null,
+    prospectEmail: (row.prospect_email as string | null) ?? null,
+    subject: (row.subject as string | null) ?? null,
+    bodyText: (row.body_text as string | null) ?? null,
   };
 }
 
-export async function listOpenReviewQueue(admin: AdminUser): Promise<ReviewQueueItem[]> {
-  const result = await pool.query(
-    `
-    SELECT
-      rq.*,
-      m.subject,
-      m.body_text,
-      m.direction,
-      COALESCE(p.full_name, CONCAT_WS(' ', p.first_name, p.last_name)) AS prospect_name,
-      p.email AS prospect_email,
-      p.company_name
-    FROM sdr_review_queue rq
-    LEFT JOIN sdr_messages m ON m.id = rq.message_id
-    LEFT JOIN sdr_prospects p ON p.id = rq.prospect_id
-    WHERE rq.organization_id = $1
-      AND rq.status = 'open'
-    ORDER BY rq.created_at ASC
-    `,
-    [admin.organizationId],
-  );
+export async function listOpenReviewQueue(
+  organizationId: string,
+  limit = 100,
+): Promise<{ items: ReviewQueueItem[]; autoHandledToday: number }> {
+  const client = await pool.connect();
+  try {
+    const queueResult = await client.query(
+      `
+      SELECT
+        rq.id,
+        rq.message_id,
+        rq.reason,
+        rq.classifier_guess,
+        rq.classifier_confidence,
+        rq.created_at,
+        EXTRACT(EPOCH FROM (NOW() - rq.created_at))::bigint AS age_seconds,
+        COALESCE(NULLIF(TRIM(CONCAT(COALESCE(p.first_name, ''), ' ', COALESCE(p.last_name, ''))), ''), p.full_name) AS prospect_name,
+        p.email AS prospect_email,
+        m.subject,
+        m.body_text
+      FROM sdr_review_queue rq
+      INNER JOIN sdr_messages m ON m.id = rq.message_id
+      LEFT JOIN sdr_prospects p ON p.id = m.prospect_id
+      WHERE rq.organization_id = $1
+        AND rq.status = 'open'
+      ORDER BY rq.created_at ASC
+      LIMIT $2
+      `,
+      [organizationId, limit],
+    );
 
-  return result.rows.map((row) => mapQueueRow(row));
+    const autoHandledResult = await client.query(
+      `
+      SELECT COUNT(*)::integer AS count
+      FROM sdr_messages
+      WHERE organization_id = $1
+        AND direction = 'inbound'
+        AND created_at >= date_trunc('day', NOW())
+        AND status != 'needs_review'
+      `,
+      [organizationId],
+    );
+
+    return {
+      items: queueResult.rows.map((row) => rowToQueueItem(row)),
+      autoHandledToday: Number(autoHandledResult.rows[0]?.count ?? 0),
+    };
+  } finally {
+    client.release();
+  }
 }
 
-export async function getReviewQueueItemById(
-  admin: AdminUser,
-  id: string,
-): Promise<ReviewQueueItem | null> {
-  const result = await pool.query(
-    `
-    SELECT
-      rq.*,
-      m.subject,
-      m.body_text,
-      m.direction,
-      COALESCE(p.full_name, CONCAT_WS(' ', p.first_name, p.last_name)) AS prospect_name,
-      p.email AS prospect_email,
-      p.company_name
-    FROM sdr_review_queue rq
-    LEFT JOIN sdr_messages m ON m.id = rq.message_id
-    LEFT JOIN sdr_prospects p ON p.id = rq.prospect_id
-    WHERE rq.organization_id = $1
-      AND rq.id = $2
-    LIMIT 1
-    `,
-    [admin.organizationId, id],
-  );
-
-  if (result.rowCount === 0) return null;
-  return mapQueueRow(result.rows[0]);
-}
-
-export async function resolveReviewQueueItem(
-  admin: AdminUser,
+export async function getReviewThreadById(
+  organizationId: string,
   reviewId: string,
-  input: ResolveReviewInput,
-): Promise<{ ok: true }> {
+): Promise<ReviewThreadDetail | null> {
+  const client = await pool.connect();
+  try {
+    const head = await client.query(
+      `
+      SELECT
+        rq.id,
+        rq.reason,
+        rq.classifier_guess,
+        rq.classifier_confidence,
+        rq.created_at,
+        EXTRACT(EPOCH FROM (NOW() - rq.created_at))::bigint AS age_seconds,
+        rq.message_id,
+        m.thread_ref,
+        COALESCE(NULLIF(TRIM(CONCAT(COALESCE(p.first_name, ''), ' ', COALESCE(p.last_name, ''))), ''), p.full_name) AS prospect_name,
+        p.email AS prospect_email
+      FROM sdr_review_queue rq
+      INNER JOIN sdr_messages m ON m.id = rq.message_id
+      LEFT JOIN sdr_prospects p ON p.id = m.prospect_id
+      WHERE rq.organization_id = $1
+        AND rq.id = $2
+      LIMIT 1
+      `,
+      [organizationId, reviewId],
+    );
+
+    if (head.rowCount === 0) {
+      return null;
+    }
+
+    const row = head.rows[0];
+    const threadRef = (row.thread_ref as string | null) ?? null;
+    let messagesResult;
+    if (threadRef) {
+      messagesResult = await client.query(
+        `
+        SELECT id, direction, subject, body_text, sent_at, created_at
+        FROM sdr_messages
+        WHERE organization_id = $1
+          AND thread_ref = $2
+        ORDER BY COALESCE(sent_at, created_at) ASC
+        `,
+        [organizationId, threadRef],
+      );
+    } else {
+      messagesResult = await client.query(
+        `
+        SELECT id, direction, subject, body_text, sent_at, created_at
+        FROM sdr_messages
+        WHERE organization_id = $1
+          AND id = $2
+        `,
+        [organizationId, String(row.message_id)],
+      );
+    }
+
+    return {
+      id: String(row.id),
+      reason: String(row.reason) as ReviewQueueReason,
+      classifierGuess: (row.classifier_guess as ReviewClassification | null) ?? null,
+      classifierConfidence:
+        row.classifier_confidence === null || row.classifier_confidence === undefined
+          ? null
+          : Number(row.classifier_confidence),
+      createdAt: String(row.created_at),
+      ageSeconds: Number(row.age_seconds ?? 0),
+      messageId: String(row.message_id),
+      threadRef,
+      prospectName: (row.prospect_name as string | null) ?? null,
+      prospectEmail: (row.prospect_email as string | null) ?? null,
+      messages: messagesResult.rows.map((m) => ({
+        id: String(m.id),
+        direction: String(m.direction),
+        subject: (m.subject as string | null) ?? null,
+        bodyText: (m.body_text as string | null) ?? null,
+        sentAt: (m.sent_at as string | null) ?? null,
+        createdAt: String(m.created_at),
+      })),
+    };
+  } finally {
+    client.release();
+  }
+}
+
+export async function resolveReview(input: ResolveReviewInput): Promise<{ ok: true }> {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
-    const reviewRes = await client.query(
+    const lock = await client.query(
       `
-      SELECT id, organization_id, message_id, prospect_id, status
+      SELECT id, message_id, status
       FROM sdr_review_queue
-      WHERE id = $1 AND organization_id = $2
-      LIMIT 1
+      WHERE id = $1
+        AND organization_id = $2
+      FOR UPDATE
       `,
-      [reviewId, admin.organizationId],
+      [input.reviewId, input.organizationId],
     );
 
-    if (reviewRes.rowCount === 0) {
-      throw new Error("Review item not found.");
+    if (lock.rowCount === 0) {
+      await client.query("ROLLBACK");
+      throw new Error("review_not_found");
     }
 
-    const review = reviewRes.rows[0];
-    if (review.status !== "open") {
-      throw new Error("Review item is already resolved.");
+    const status = String(lock.rows[0].status);
+    if (status !== "open") {
+      await client.query("ROLLBACK");
+      throw new Error("already_resolved");
     }
 
     await client.query(
       `
-      INSERT INTO sdr_review_decisions
-      (id, organization_id, review_id, operator_id, corrected_classification, action, notes, decided_at, created_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+      INSERT INTO sdr_review_decisions (
+        id,
+        organization_id,
+        review_id,
+        operator_id,
+        corrected_classification,
+        action,
+        notes,
+        decided_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
       `,
       [
         randomUUID(),
-        admin.organizationId,
-        reviewId,
-        admin.id,
+        input.organizationId,
+        input.reviewId,
+        input.operatorId,
         input.correctedClassification,
         input.action,
         input.notes,
@@ -169,34 +274,45 @@ export async function resolveReviewQueueItem(
     await client.query(
       `
       UPDATE sdr_review_queue
-      SET
-        status = 'resolved',
-        assigned_to_user_id = $1,
-        resolved_at = NOW(),
-        updated_at = NOW()
-      WHERE id = $2 AND organization_id = $3
+      SET status = 'resolved',
+          updated_at = NOW(),
+          resolved_at = NOW()
+      WHERE id = $1
+        AND organization_id = $2
       `,
-      [admin.id, reviewId, admin.organizationId],
+      [input.reviewId, input.organizationId],
     );
 
-    if (input.action === "suppress" && review.prospect_id) {
-      await client.query(
+    if (input.action === "suppress") {
+      const messageRes = await client.query(
         `
-        INSERT INTO sdr_suppressions
-        (id, organization_id, email, domain, reason, source_message_id, created_at)
-        SELECT
-          $1,
-          $2,
-          p.email,
-          p.company_domain,
-          $3,
-          $4,
-          NOW()
-        FROM sdr_prospects p
-        WHERE p.id = $5
+        SELECT m.id, p.email, p.company_domain
+        FROM sdr_messages m
+        LEFT JOIN sdr_prospects p ON p.id = m.prospect_id
+        WHERE m.id = $1
+          AND m.organization_id = $2
+        LIMIT 1
         `,
-        [randomUUID(), admin.organizationId, "operator_review_suppress", review.message_id, review.prospect_id],
+        [String(lock.rows[0].message_id), input.organizationId],
       );
+
+      if (messageRes.rowCount && messageRes.rows[0].email) {
+        await client.query(
+          `
+          INSERT INTO sdr_suppressions (
+            id, organization_id, email, domain, reason, source_message_id, created_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, NOW())
+          `,
+          [
+            randomUUID(),
+            input.organizationId,
+            String(messageRes.rows[0].email),
+            (messageRes.rows[0].company_domain as string | null) ?? null,
+            "operator_review_suppression",
+            String(messageRes.rows[0].id),
+          ],
+        );
+      }
     }
 
     await client.query("COMMIT");
@@ -207,21 +323,4 @@ export async function resolveReviewQueueItem(
   } finally {
     client.release();
   }
-}
-
-export async function getTodayAutoHandledCount(admin: AdminUser): Promise<number> {
-  const result = await pool.query(
-    `
-    SELECT COUNT(*)::int AS count
-    FROM sdr_messages m
-    WHERE m.organization_id = $1
-      AND m.direction = 'inbound'
-      AND m.created_at::date = NOW()::date
-      AND NOT EXISTS (
-        SELECT 1 FROM sdr_review_queue rq WHERE rq.message_id = m.id
-      )
-    `,
-    [admin.organizationId],
-  );
-  return result.rows[0]?.count ?? 0;
 }
