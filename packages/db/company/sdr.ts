@@ -314,4 +314,68 @@ CREATE INDEX IF NOT EXISTS sdr_review_queue_org_idx ON sdr_review_queue(organiza
 CREATE INDEX IF NOT EXISTS sdr_review_queue_org_status_idx ON sdr_review_queue(organization_id, status);
 CREATE INDEX IF NOT EXISTS sdr_review_queue_org_scope_idx ON sdr_review_queue(organization_id, scope, status);
 CREATE INDEX IF NOT EXISTS sdr_review_queue_reply_idx ON sdr_review_queue(reply_id);
+
+-- F1-008: Calendar Booking + Pre-Meeting Brief.
+-- The handoff point buyers actually want — the founder takes over ONLY once a
+-- meeting is booked. One row per prospect meeting, tenant-scoped by
+-- organization_id. status walks proposed → confirmed → (held | no_show |
+-- cancelled). proposed_slots holds the three freebusy-clear slots we offered in
+-- the prospect's timezone; starts_at/ends_at are the single slot the prospect
+-- confirmed; calendar_event_id + meet_link come back from Google Calendar after
+-- the event is created with conferenceData. proposal_message_id /
+-- confirmation_message_id link the outbound sdr_messages the agent sent.
+-- Free-form text columns carry NO CHECK constraint (enum values enforced in app).
+CREATE TABLE IF NOT EXISTS sdr_meetings (
+  id UUID PRIMARY KEY,
+  organization_id UUID NOT NULL,
+  prospect_id UUID REFERENCES sdr_prospects(id) ON DELETE SET NULL,
+  reply_id UUID REFERENCES sdr_replies(id) ON DELETE SET NULL,
+  campaign_id UUID REFERENCES sdr_campaigns(id) ON DELETE SET NULL,
+  mailbox_id UUID,
+  calendar_event_id TEXT,
+  meet_link TEXT,
+  starts_at TIMESTAMPTZ,
+  ends_at TIMESTAMPTZ,
+  timezone TEXT NOT NULL DEFAULT 'UTC',
+  status TEXT NOT NULL DEFAULT 'proposed',
+  proposed_slots JSONB NOT NULL DEFAULT '[]'::jsonb,
+  proposal_message_id UUID,
+  confirmation_message_id UUID,
+  referral_prompted_at TIMESTAMPTZ,
+  last_error TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS sdr_meetings_org_idx ON sdr_meetings(organization_id);
+CREATE INDEX IF NOT EXISTS sdr_meetings_org_status_idx ON sdr_meetings(organization_id, status);
+CREATE INDEX IF NOT EXISTS sdr_meetings_org_starts_idx ON sdr_meetings(organization_id, starts_at);
+CREATE INDEX IF NOT EXISTS sdr_meetings_prospect_idx ON sdr_meetings(prospect_id);
+CREATE UNIQUE INDEX IF NOT EXISTS sdr_meetings_prospect_active_uniq
+  ON sdr_meetings(prospect_id)
+  WHERE status IN ('proposed', 'confirmed');
+
+-- F1-008: the pre-meeting brief. Composed from the prospect's Apollo record +
+-- 1-5 sdr_prospect_signals + the thread summary, delivered via @nexus/notifications
+-- 12 hours before starts_at. brief_markdown is the magazine-style body rendered on
+-- /meetings/[id]; headline + what_to_say_first are the structured callouts the UI
+-- surfaces. delivered_at is stamped when the 12h-before notification fires.
+CREATE TABLE IF NOT EXISTS sdr_meeting_briefs (
+  id UUID PRIMARY KEY,
+  organization_id UUID NOT NULL,
+  meeting_id UUID NOT NULL REFERENCES sdr_meetings(id) ON DELETE CASCADE,
+  prospect_id UUID REFERENCES sdr_prospects(id) ON DELETE SET NULL,
+  headline TEXT,
+  brief_markdown TEXT NOT NULL,
+  what_to_say_first TEXT,
+  signal_count INTEGER NOT NULL DEFAULT 0,
+  source TEXT NOT NULL DEFAULT 'fallback',
+  generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  delivered_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS sdr_meeting_briefs_org_idx ON sdr_meeting_briefs(organization_id);
+CREATE UNIQUE INDEX IF NOT EXISTS sdr_meeting_briefs_meeting_uniq ON sdr_meeting_briefs(meeting_id);
+CREATE INDEX IF NOT EXISTS sdr_meeting_briefs_prospect_idx ON sdr_meeting_briefs(prospect_id);
 `;
