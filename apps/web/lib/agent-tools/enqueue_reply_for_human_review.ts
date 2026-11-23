@@ -1,180 +1,153 @@
-import { randomUUID } from "node:crypto";
 import type { HandlerContext, HandlerResult } from "@nexus/identity-and-access";
 
-type Args = {
-  organization_id?: string;
-  sequence_id?: string;
-  contact_id?: string;
-  thread_id?: string;
-  scope?: "customer" | "operator";
-  reason?: "unsubscribe" | "legal_threat" | "unclear" | "low_confidence";
-  confidence?: number;
-  note?: string;
-};
+type Args = Record<string, unknown>;
 
-type SqlClient = {
-  query: (
-    sql: string,
-    params?: readonly unknown[],
-  ) => Promise<{ rows?: Array<Record<string, unknown>> }>;
-};
+type Scope = "customer" | "operator";
 
-type CtxWithSql = HandlerContext & {
-  db?: SqlClient;
-  sql?: SqlClient;
-};
-
-const ALLOWED_REASONS = new Set<NonNullable<Args["reason"]>>([
-  "unsubscribe",
-  "legal_threat",
-  "unclear",
-  "low_confidence",
-]);
-
-function asSqlClient(ctx: CtxWithSql): SqlClient | null {
-  if (ctx.db && typeof ctx.db.query === "function") {
-    return ctx.db;
-  }
-  if (ctx.sql && typeof ctx.sql.query === "function") {
-    return ctx.sql;
-  }
-  return null;
+interface ParsedArgs {
+  organizationId: string;
+  threadId: string;
+  reason: string;
+  scope: Scope;
 }
 
-function toSafeNumber(value: unknown): number | null {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return value;
-  }
-  return null;
+function asNonEmptyString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed: string = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
 }
 
-function toStringOrNull(value: unknown): string | null {
-  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+function parseScope(value: unknown): Scope {
+  if (value === "operator") return "operator";
+  return "customer";
+}
+
+function parseArgs(args: Args): ParsedArgs | null {
+  const organizationId: string | null = asNonEmptyString(
+    args.organization_id ?? args.organizationId,
+  );
+  const threadId: string | null = asNonEmptyString(args.thread_id ?? args.threadId);
+  const reason: string | null = asNonEmptyString(args.reason);
+  const scope: Scope = parseScope(args.scope);
+
+  if (!organizationId || !threadId || !reason) {
+    return null;
+  }
+
+  return {
+    organizationId,
+    threadId,
+    reason,
+    scope,
+  };
+}
+
+function isPgPoolClient(value: unknown): value is {
+  query: (sql: string, params?: unknown[]) => Promise<{ rowCount?: number; rows?: unknown[] }>;
+} {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "query" in value &&
+    typeof (value as { query?: unknown }).query === "function"
+  );
+}
+
+async function insertReviewQueueRow(
+  db: { query: (sql: string, params?: unknown[]) => Promise<{ rowCount?: number }> },
+  parsed: ParsedArgs,
+): Promise<void> {
+  await db.query(
+    `
+      INSERT INTO sdr_review_queue (
+        id,
+        organization_id,
+        thread_id,
+        scope,
+        reason,
+        status,
+        created_at,
+        updated_at
+      )
+      VALUES (
+        gen_random_uuid(),
+        $1,
+        $2,
+        $3,
+        $4,
+        'pending',
+        NOW(),
+        NOW()
+      )
+    `,
+    [parsed.organizationId, parsed.threadId, parsed.scope, parsed.reason],
+  );
+}
+
+async function pauseSequenceForThread(
+  db: { query: (sql: string, params?: unknown[]) => Promise<{ rowCount?: number }> },
+  parsed: ParsedArgs,
+): Promise<void> {
+  await db.query(
+    `
+      UPDATE sdr_sequence_enrollments
+      SET
+        status = 'paused',
+        paused_reason = 'human_review_required',
+        paused_at = NOW(),
+        updated_at = NOW()
+      WHERE organization_id = $1
+        AND thread_id = $2
+        AND status <> 'paused'
+    `,
+    [parsed.organizationId, parsed.threadId],
+  );
 }
 
 export async function handleEnqueueReplyForHumanReview(
   ctx: HandlerContext,
   args: Args,
 ): Promise<HandlerResult> {
-  const sql = asSqlClient(ctx as CtxWithSql);
-  if (!sql) {
+  const parsed: ParsedArgs | null = parseArgs(args);
+  if (!parsed) {
     return {
       ok: false,
-      error: "missing_db_client",
-      message: "No database client found on handler context.",
-    } as HandlerResult;
-  }
-
-  const organizationId = toStringOrNull(args.organization_id);
-  const sequenceId = toStringOrNull(args.sequence_id);
-  const contactId = toStringOrNull(args.contact_id);
-  const threadId = toStringOrNull(args.thread_id);
-  const scope = (toStringOrNull(args.scope) ?? "operator") as "customer" | "operator";
-  const reason = toStringOrNull(args.reason) as Args["reason"] | null;
-  const note = toStringOrNull(args.note);
-  const confidence = toSafeNumber(args.confidence);
-
-  if (!organizationId || !sequenceId || !contactId || !threadId) {
-    return {
-      ok: false,
-      error: "invalid_arguments",
+      error: "invalid_args",
       message:
-        "organization_id, sequence_id, contact_id, and thread_id are required string arguments.",
+        "enqueue_reply_for_human_review requires organization_id, thread_id, and reason as non-empty strings.",
     } as HandlerResult;
   }
 
-  if (scope !== "customer" && scope !== "operator") {
+  const maybeDb: unknown = (ctx as { db?: unknown }).db ?? (ctx as { pool?: unknown }).pool;
+  if (!isPgPoolClient(maybeDb)) {
     return {
       ok: false,
-      error: "invalid_scope",
-      message: "scope must be either 'customer' or 'operator'.",
+      error: "db_unavailable",
+      message: "Database client not available on handler context.",
     } as HandlerResult;
   }
-
-  if (!reason || !ALLOWED_REASONS.has(reason)) {
-    return {
-      ok: false,
-      error: "invalid_reason",
-      message: "reason must be one of: unsubscribe, legal_threat, unclear, low_confidence.",
-    } as HandlerResult;
-  }
-
-  if (reason === "low_confidence") {
-    if (confidence === null) {
-      return {
-        ok: false,
-        error: "invalid_confidence",
-        message: "confidence is required when reason is low_confidence.",
-      } as HandlerResult;
-    }
-    if (confidence >= 0.85) {
-      return {
-        ok: false,
-        error: "confidence_not_below_threshold",
-        message: "low_confidence reason requires confidence < 0.85.",
-      } as HandlerResult;
-    }
-  }
-
-  const reviewId = randomUUID();
 
   try {
-    await sql.query(
-      `
-      INSERT INTO sdr_review_queue (
-        id,
-        organization_id,
-        sequence_id,
-        contact_id,
-        thread_id,
-        scope,
-        reason,
-        confidence,
-        note,
-        status,
-        created_at,
-        updated_at
-      ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', NOW(), NOW()
-      )
-      `,
-      [
-        reviewId,
-        organizationId,
-        sequenceId,
-        contactId,
-        threadId,
-        scope,
-        reason,
-        confidence,
-        note,
-      ],
-    );
-
-    await sql.query(
-      `
-      UPDATE sdr_sequences
-      SET status = 'paused', paused_reason = 'human_review', updated_at = NOW()
-      WHERE id = $1 AND organization_id = $2
-      `,
-      [sequenceId, organizationId],
-    );
+    await insertReviewQueueRow(maybeDb, parsed);
+    await pauseSequenceForThread(maybeDb, parsed);
 
     return {
       ok: true,
       data: {
-        review_queue_id: reviewId,
+        enqueued: true,
+        organization_id: parsed.organizationId,
+        thread_id: parsed.threadId,
+        scope: parsed.scope,
+        reason: parsed.reason,
         sequence_paused: true,
-        scope,
-        reason,
       },
     } as HandlerResult;
   } catch (error: unknown) {
-    const message =
-      error instanceof Error ? error.message : "Unknown error while enqueueing human review.";
+    const message: string =
+      error instanceof Error ? error.message : "Unknown error while enqueueing for human review.";
     return {
       ok: false,
-      error: "enqueue_reply_for_human_review_failed",
+      error: "enqueue_failed",
       message,
     } as HandlerResult;
   }
