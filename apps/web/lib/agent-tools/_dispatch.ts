@@ -39,4 +39,3 @@ export const DOMAIN_DISPATCH: Record<
   book_meeting: (ctx, a) => handleBookMeeting(ctx, a),
   pause_mailbox_sending: (ctx, a) => handlePauseMailboxSending(ctx, a),
 };
-

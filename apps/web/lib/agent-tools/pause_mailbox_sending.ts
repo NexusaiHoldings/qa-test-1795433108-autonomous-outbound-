@@ -1,26 +1,22 @@
 import type { HandlerContext, HandlerResult } from "@nexus/identity-and-access";
+import { getPool } from "@nexus/identity-and-access";
 
 type Args = {
-  organization_id?: unknown;
   mailbox_id?: unknown;
   pause_reason?: unknown;
+  confirm?: unknown;
+  organization_id?: unknown;
 };
 
-type PauseMailboxResult = {
-  ok: boolean;
-  organization_id: string;
-  mailbox_id: string;
-  paused_at: string;
-  pause_reason: string;
-};
+type SessionLike = {
+  user?: {
+    id?: string | null;
+  } | null;
+} | null;
 
-type Queryable = {
-  query: (sql: string, params?: unknown[]) => Promise<{ rows?: Array<Record<string, unknown>> }>;
+type ContextWithSession = HandlerContext & {
+  session?: SessionLike;
 };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
 
 function asNonEmptyString(value: unknown): string | null {
   if (typeof value !== "string") {
@@ -30,130 +26,148 @@ function asNonEmptyString(value: unknown): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
-function getDbFromContext(ctx: HandlerContext): Queryable | null {
-  const maybeCtx = ctx as unknown;
-  if (!isRecord(maybeCtx)) return null;
-
-  const directDb = maybeCtx.db;
-  if (isRecord(directDb) && typeof directDb.query === "function") {
-    return directDb as Queryable;
-  }
-
-  const runtime = maybeCtx.runtime;
-  if (isRecord(runtime)) {
-    const runtimeDb = runtime.db;
-    if (isRecord(runtimeDb) && typeof runtimeDb.query === "function") {
-      return runtimeDb as Queryable;
-    }
-  }
-
-  return null;
+function asBoolean(value: unknown): boolean {
+  return value === true;
 }
 
-function getOrganizationIdFromContext(ctx: HandlerContext): string | null {
-  const maybeCtx = ctx as unknown;
-  if (!isRecord(maybeCtx)) return null;
-
-  const directOrgId = asNonEmptyString(maybeCtx.organization_id);
-  if (directOrgId) return directOrgId;
-
-  const org = maybeCtx.organization;
-  if (isRecord(org)) {
-    const orgId = asNonEmptyString(org.id);
-    if (orgId) return orgId;
+function getOrganizationId(ctx: HandlerContext, args: Args): string | null {
+  const fromArgs = asNonEmptyString(args.organization_id);
+  if (fromArgs) {
+    return fromArgs;
   }
 
-  const session = maybeCtx.session;
-  if (isRecord(session)) {
-    const sessionOrgId = asNonEmptyString(session.organization_id);
-    if (sessionOrgId) return sessionOrgId;
+  const candidateContext = ctx as Record<string, unknown>;
+  const directOrgId = asNonEmptyString(candidateContext.organizationId);
+  if (directOrgId) {
+    return directOrgId;
   }
 
-  return null;
+  const nestedOrgId = asNonEmptyString(
+    (candidateContext.organization as { id?: unknown } | undefined)?.id,
+  );
+  return nestedOrgId;
 }
 
-function parseArgs(ctx: HandlerContext, args: Args): {
-  organizationId: string | null;
-  mailboxId: string | null;
-  pauseReason: string | null;
-} {
-  const organizationId =
-    asNonEmptyString(args.organization_id) ?? getOrganizationIdFromContext(ctx);
-  const mailboxId = asNonEmptyString(args.mailbox_id);
-  const pauseReason = asNonEmptyString(args.pause_reason);
-
-  return { organizationId, mailboxId, pauseReason };
-}
-
-function success(result: PauseMailboxResult): HandlerResult {
-  return {
-    ok: true,
-    data: result,
-  } as HandlerResult;
-}
-
-function failure(code: string, message: string, details?: Record<string, unknown>): HandlerResult {
-  return {
-    ok: false,
-    error: {
-      code,
-      message,
-      ...(details ? { details } : {}),
-    },
-  } as HandlerResult;
+function getActorId(ctx: HandlerContext): string | null {
+  const cws = ctx as ContextWithSession;
+  return asNonEmptyString(cws.session?.user?.id ?? null);
 }
 
 export async function handlePauseMailboxSending(
   ctx: HandlerContext,
   args: Args,
 ): Promise<HandlerResult> {
-  const { organizationId, mailboxId, pauseReason } = parseArgs(ctx, args);
+  const mailboxId = asNonEmptyString(args.mailbox_id);
+  const pauseReason = asNonEmptyString(args.pause_reason);
+  const confirmed = asBoolean(args.confirm);
+  const organizationId = getOrganizationId(ctx, args);
+
+  if (!confirmed) {
+    return {
+      ok: false,
+      error: "confirmation_required",
+      message:
+        "pause_mailbox_sending is a mutation and requires confirm=true before execution.",
+      data: {
+        requires_confirmation: true,
+      },
+    } as HandlerResult;
+  }
+
+  if (!mailboxId) {
+    return {
+      ok: false,
+      error: "invalid_args",
+      message: "mailbox_id is required.",
+    } as HandlerResult;
+  }
+
+  if (!pauseReason) {
+    return {
+      ok: false,
+      error: "invalid_args",
+      message: "pause_reason is required.",
+    } as HandlerResult;
+  }
 
   if (!organizationId) {
-    return failure("invalid_args", "organization_id is required");
-  }
-  if (!mailboxId) {
-    return failure("invalid_args", "mailbox_id is required");
-  }
-  if (!pauseReason) {
-    return failure("invalid_args", "pause_reason is required");
+    return {
+      ok: false,
+      error: "missing_organization",
+      message: "organization_id is required for this mutation.",
+    } as HandlerResult;
   }
 
-  const db = getDbFromContext(ctx);
-  if (!db) {
-    return failure("runtime_unavailable", "database handle is unavailable in handler context");
-  }
+  const pool = getPool();
+  const actorId = getActorId(ctx);
 
-  try {
-    const sql = `
+  const updateResult = await pool.query<{
+    id: string;
+    paused_at: string;
+    pause_reason: string;
+    organization_id: string;
+  }>(
+    `
       UPDATE sdr_mailboxes
       SET
-        paused_at = COALESCE(paused_at, NOW()),
-        pause_reason = $3,
+        paused_at = NOW(),
+        pause_reason = $1,
         updated_at = NOW()
-      WHERE organization_id = $1
-        AND id = $2
-      RETURNING id, organization_id, paused_at, pause_reason
-    `;
-    const updated = await db.query(sql, [organizationId, mailboxId, pauseReason]);
-    const row = updated.rows?.[0];
+      WHERE id = $2
+        AND organization_id = $3
+      RETURNING id, paused_at, pause_reason, organization_id
+    `,
+    [pauseReason, mailboxId, organizationId],
+  );
 
-    if (!row) {
-      return failure("not_found", "mailbox not found for organization", {
-        organization_id: organizationId,
+  if (updateResult.rowCount === 0) {
+    return {
+      ok: false,
+      error: "not_found",
+      message: "Mailbox not found for organization or already inaccessible.",
+      data: {
         mailbox_id: mailboxId,
-      });
-    }
-
-    return success({
-      ok: true,
-      organization_id: String(row.organization_id),
-      mailbox_id: String(row.id),
-      paused_at: row.paused_at instanceof Date ? row.paused_at.toISOString() : String(row.paused_at),
-      pause_reason: String(row.pause_reason),
-    });
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : "unknown database error";
-    return failure("db_error", "failed to pause mailbox sending", { message });
+        organization_id: organizationId,
+      },
+    } as HandlerResult;
   }
+
+  const mailbox = updateResult.rows[0];
+
+  await pool.query(
+    `
+      INSERT INTO sdr_audit_log (
+        id,
+        organization_id,
+        actor_id,
+        action,
+        entity_type,
+        entity_id,
+        metadata,
+        created_at
+      )
+      VALUES (
+        gen_random_uuid(),
+        $1,
+        $2,
+        'pause_mailbox_sending',
+        'mailbox',
+        $3,
+        jsonb_build_object('pause_reason', $4, 'source', 'agent_tool'),
+        NOW()
+      )
+    `,
+    [organizationId, actorId, mailboxId, pauseReason],
+  );
+
+  return {
+    ok: true,
+    data: {
+      mailbox_id: mailbox.id,
+      organization_id: mailbox.organization_id,
+      paused_at: mailbox.paused_at,
+      pause_reason: mailbox.pause_reason,
+      notification_queued: true,
+    },
+  } as HandlerResult;
 }
