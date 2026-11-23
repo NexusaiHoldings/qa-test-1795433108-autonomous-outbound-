@@ -19,6 +19,11 @@ ALTER TABLE sdr_campaigns ADD COLUMN IF NOT EXISTS daily_target INTEGER NOT NULL
 ALTER TABLE sdr_campaigns ADD COLUMN IF NOT EXISTS apollo_filters JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE sdr_campaigns ADD COLUMN IF NOT EXISTS last_sourced_at TIMESTAMPTZ;
 
+-- F1-005: the campaign value proposition the grounded generator weaves into
+-- every sequence (the CEO briefing's "GPT-powered 3-email generator" needs an
+-- explicit offer to ground against, separate from the Apollo targeting filters).
+ALTER TABLE sdr_campaigns ADD COLUMN IF NOT EXISTS value_prop TEXT;
+
 CREATE TABLE IF NOT EXISTS sdr_prospects (
   id UUID PRIMARY KEY,
   organization_id UUID NOT NULL,
@@ -84,8 +89,64 @@ CREATE TABLE IF NOT EXISTS sdr_messages (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- F1-005: sdr_messages is extended into a sequence touch. A message now belongs
+-- to an sdr_sequences row, carries a touch_index (0-based position in the 3-touch
+-- cadence), a workflow status enum (draft | approved | queued | sent | bounced |
+-- cancelled), and signal_citations (JSON array mapping each personalized sentence
+-- to the sdr_prospect_signals.id that grounds it — the grounding-check gate).
+ALTER TABLE sdr_messages ADD COLUMN IF NOT EXISTS sequence_id UUID;
+ALTER TABLE sdr_messages ADD COLUMN IF NOT EXISTS touch_index INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sdr_messages ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'draft';
+ALTER TABLE sdr_messages ADD COLUMN IF NOT EXISTS signal_citations JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE sdr_messages ADD COLUMN IF NOT EXISTS next_send_at TIMESTAMPTZ;
+ALTER TABLE sdr_messages ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
 CREATE INDEX IF NOT EXISTS sdr_messages_org_idx ON sdr_messages(organization_id);
 CREATE INDEX IF NOT EXISTS sdr_messages_org_provider_msg_idx ON sdr_messages(organization_id, provider_message_id);
+CREATE INDEX IF NOT EXISTS sdr_messages_sequence_idx ON sdr_messages(sequence_id, touch_index);
+CREATE INDEX IF NOT EXISTS sdr_messages_org_status_idx ON sdr_messages(organization_id, status);
+
+-- F1-005: a prospect's 3-touch outbound sequence. One row per prospect+campaign;
+-- segment_key = vertical + title-band, the unit the founder approves once so that
+-- subsequent sequences in the same segment send autonomously.
+CREATE TABLE IF NOT EXISTS sdr_sequences (
+  id UUID PRIMARY KEY,
+  organization_id UUID NOT NULL,
+  prospect_id UUID NOT NULL REFERENCES sdr_prospects(id) ON DELETE CASCADE,
+  campaign_id UUID REFERENCES sdr_campaigns(id) ON DELETE SET NULL,
+  segment_key TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending_approval',
+  touch_count INTEGER NOT NULL DEFAULT 0,
+  next_send_at TIMESTAMPTZ,
+  autonomous BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS sdr_sequences_org_idx ON sdr_sequences(organization_id);
+CREATE INDEX IF NOT EXISTS sdr_sequences_org_status_idx ON sdr_sequences(organization_id, status);
+CREATE INDEX IF NOT EXISTS sdr_sequences_org_segment_idx ON sdr_sequences(organization_id, segment_key);
+CREATE INDEX IF NOT EXISTS sdr_sequences_campaign_idx ON sdr_sequences(campaign_id);
+CREATE UNIQUE INDEX IF NOT EXISTS sdr_sequences_prospect_uniq ON sdr_sequences(prospect_id);
+
+-- F1-005: the founder's first-send approval of a segment. Writing a row here flips
+-- the segment autonomous — future sourced prospects in this (campaign, segment_key)
+-- are queued without review. sample_message_ids records the batch that was reviewed.
+CREATE TABLE IF NOT EXISTS sdr_segment_approvals (
+  id UUID PRIMARY KEY,
+  organization_id UUID NOT NULL,
+  campaign_id UUID REFERENCES sdr_campaigns(id) ON DELETE CASCADE,
+  segment_key TEXT NOT NULL,
+  approved_by UUID,
+  approved_by_email TEXT,
+  approved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  sample_message_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS sdr_segment_approvals_org_idx ON sdr_segment_approvals(organization_id);
+CREATE UNIQUE INDEX IF NOT EXISTS sdr_segment_approvals_uniq
+  ON sdr_segment_approvals(organization_id, campaign_id, segment_key);
 
 CREATE TABLE IF NOT EXISTS sdr_suppressions (
   id UUID PRIMARY KEY,
