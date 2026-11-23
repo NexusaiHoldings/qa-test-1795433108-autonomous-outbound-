@@ -173,4 +173,75 @@ CREATE TABLE IF NOT EXISTS sdr_unsubscribe_events (
 
 CREATE INDEX IF NOT EXISTS sdr_unsubscribe_events_token_hash_idx ON sdr_unsubscribe_events(token_hash);
 CREATE INDEX IF NOT EXISTS sdr_unsubscribe_events_ts_idx ON sdr_unsubscribe_events(event_timestamp);
+
+-- F1-006: threading refs so touches 2-3 reply inside touch 1's conversation.
+-- thread_ref holds the Gmail threadId / Graph conversationId; rfc822_message_id
+-- holds the RFC822 Message-ID used for In-Reply-To / References. sent_mailbox_id
+-- records which mailbox actually sent the touch.
+ALTER TABLE sdr_messages ADD COLUMN IF NOT EXISTS thread_ref TEXT;
+ALTER TABLE sdr_messages ADD COLUMN IF NOT EXISTS rfc822_message_id TEXT;
+ALTER TABLE sdr_messages ADD COLUMN IF NOT EXISTS sent_mailbox_id UUID;
+ALTER TABLE sdr_messages ADD COLUMN IF NOT EXISTS last_error TEXT;
+
+-- F1-006: Founder Mailbox Sender + Send Guardrails.
+-- The 'send' verb executes from the founder's OWN Gmail/Outlook so the customer
+-- (not Nexus) is the CAN-SPAM sender and replies land in the inbox the founder
+-- already lives in. One row per connected sending mailbox, tenant-scoped by
+-- organization_id. OAuth connection is nominally via @nexus/profile-and-account
+-- connected accounts (connected_account_ref), but the extended Gmail/Graph send
+-- scopes are a lego gap (flagged in blockers) so the access/refresh tokens are
+-- held here until the lego closes that gap.
+CREATE TABLE IF NOT EXISTS sdr_mailboxes (
+  id UUID PRIMARY KEY,
+  organization_id UUID NOT NULL,
+  provider TEXT NOT NULL DEFAULT 'gmail',
+  email TEXT NOT NULL,
+  domain TEXT,
+  connected_account_ref UUID,
+  display_name TEXT,
+  physical_address TEXT,
+  status TEXT NOT NULL DEFAULT 'connected',
+  warmup_stage INTEGER NOT NULL DEFAULT 0,
+  daily_cap INTEGER NOT NULL DEFAULT 20,
+  sent_today INTEGER NOT NULL DEFAULT 0,
+  sent_today_date DATE,
+  warmup_started_at TIMESTAMPTZ,
+  paused_at TIMESTAMPTZ,
+  pause_reason TEXT,
+  spf_ok BOOLEAN NOT NULL DEFAULT FALSE,
+  dkim_ok BOOLEAN NOT NULL DEFAULT FALSE,
+  dmarc_ok BOOLEAN NOT NULL DEFAULT FALSE,
+  dns_detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+  dns_checked_at TIMESTAMPTZ,
+  access_token TEXT,
+  refresh_token TEXT,
+  token_expires_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS sdr_mailboxes_org_idx ON sdr_mailboxes(organization_id);
+CREATE UNIQUE INDEX IF NOT EXISTS sdr_mailboxes_org_email_uniq
+  ON sdr_mailboxes(organization_id, lower(email));
+CREATE INDEX IF NOT EXISTS sdr_mailboxes_status_idx ON sdr_mailboxes(organization_id, status);
+
+-- F1-006: the deliverability ledger for every send attempt. event is an enum of
+-- queued | sent | bounced_soft | bounced_hard | complaint | opened_unreliable;
+-- provider_payload captures the raw provider response / bounce DSN / feedback
+-- loop body for audit. Rows drive the warmup ramp, the pause-on-complaint guard,
+-- and the /mailbox sending-health gauge.
+CREATE TABLE IF NOT EXISTS sdr_send_events (
+  id UUID PRIMARY KEY,
+  organization_id UUID NOT NULL,
+  message_id UUID,
+  mailbox_id UUID NOT NULL,
+  event TEXT NOT NULL,
+  provider_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS sdr_send_events_org_idx ON sdr_send_events(organization_id);
+CREATE INDEX IF NOT EXISTS sdr_send_events_mailbox_idx ON sdr_send_events(mailbox_id, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS sdr_send_events_message_idx ON sdr_send_events(message_id);
+CREATE INDEX IF NOT EXISTS sdr_send_events_event_idx ON sdr_send_events(organization_id, event);
 `;
