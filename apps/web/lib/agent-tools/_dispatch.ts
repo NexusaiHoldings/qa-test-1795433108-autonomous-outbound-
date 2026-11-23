@@ -27,6 +27,7 @@ import type { HandlerContext, HandlerResult } from "@nexus/identity-and-access";
 import { handleEnqueueReplyForHumanReview } from "./enqueue_reply_for_human_review";
 import { handleBookMeeting } from "./book_meeting";
 import { handlePauseMailboxSending } from "./pause_mailbox_sending";
+import { handleAddToSuppressionList } from "./add_to_suppression_list";
 
 type Args = Record<string, unknown>;
 
@@ -38,4 +39,6 @@ export const DOMAIN_DISPATCH: Record<
   enqueue_reply_for_human_review: (ctx, a) => handleEnqueueReplyForHumanReview(ctx, a),
   book_meeting: (ctx, a) => handleBookMeeting(ctx, a),
   pause_mailbox_sending: (ctx, a) => handlePauseMailboxSending(ctx, a),
+  add_to_suppression_list: (ctx, a) => handleAddToSuppressionList(ctx, a),
 };
+
