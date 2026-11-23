@@ -249,133 +249,39 @@ CREATE INDEX IF NOT EXISTS sdr_send_events_event_idx ON sdr_send_events(organiza
 -- The ingest cron polls each connected mailbox's Gmail history every 5 minutes.
 -- These columns persist the poll cursor (Gmail historyId) + last-polled stamp so
 -- subsequent polls only process new inbound mail. ALTER ... IF NOT EXISTS keeps
--- the F1-006 sdr_mailboxes table forward-compatible without a destructive rewrite.
-ALTER TABLE sdr_mailboxes ADD COLUMN IF NOT EXISTS last_history_id TEXT;
-ALTER TABLE sdr_mailboxes ADD COLUMN IF NOT EXISTS last_polled_at TIMESTAMPTZ;
+-- the F1-006 sdr_mailboxes table forwa
 
--- F1-007: every inbound reply matched to an sdr_messages thread. One row per
--- distinct inbound provider message. classification is the few-shot enum
--- (interested | soft_objection | hard_no | out_of_office | wrong_person |
--- unsubscribe | legal_threat | unclear); confidence is the model's 0-1 score;
--- extracted_datetime is the prospect-confirmed slot parsed out of an "interested"
--- reply; handled_by records who resolved it (agent | customer | operator). Free-form
--- text columns carry NO CHECK constraint (enum values are enforced in app code).
-CREATE TABLE IF NOT EXISTS sdr_replies (
-  id UUID PRIMARY KEY,
-  organization_id UUID NOT NULL,
-  campaign_id UUID REFERENCES sdr_campaigns(id) ON DELETE SET NULL,
-  prospect_id UUID REFERENCES sdr_prospects(id) ON DELETE SET NULL,
-  sequence_id UUID,
-  message_id UUID REFERENCES sdr_messages(id) ON DELETE SET NULL,
-  mailbox_id UUID,
-  thread_ref TEXT,
-  provider TEXT NOT NULL DEFAULT 'gmail',
-  provider_message_id TEXT,
-  from_email TEXT,
-  subject TEXT,
-  body_text TEXT,
-  received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  classification TEXT NOT NULL DEFAULT 'unclear',
-  confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
-  classifier_source TEXT NOT NULL DEFAULT 'fallback',
-  reasoning TEXT,
-  extracted_datetime TIMESTAMPTZ,
-  handled_by TEXT NOT NULL DEFAULT 'agent',
-  action_taken TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS sdr_replies_org_idx ON sdr_replies(organization_id);
-CREATE INDEX IF NOT EXISTS sdr_replies_org_prospect_idx ON sdr_replies(organization_id, prospect_id);
-CREATE INDEX IF NOT EXISTS sdr_replies_org_class_idx ON sdr_replies(organization_id, classification);
-CREATE INDEX IF NOT EXISTS sdr_replies_thread_idx ON sdr_replies(organization_id, thread_ref);
-CREATE INDEX IF NOT EXISTS sdr_replies_received_idx ON sdr_replies(organization_id, received_at DESC);
-CREATE UNIQUE INDEX IF NOT EXISTS sdr_replies_provider_msg_uniq
-  ON sdr_replies(organization_id, provider_message_id);
-
--- F1-007: the human review queue. scope routes an escalation to the customer
--- (the founder — soft judgment calls, low-confidence replies) or an operator
--- (Nexus staff — legal threats, abuse). status is open | resolved.
 CREATE TABLE IF NOT EXISTS sdr_review_queue (
   id UUID PRIMARY KEY,
   organization_id UUID NOT NULL,
-  reply_id UUID REFERENCES sdr_replies(id) ON DELETE CASCADE,
-  prospect_id UUID REFERENCES sdr_prospects(id) ON DELETE SET NULL,
-  scope TEXT NOT NULL DEFAULT 'customer',
+  message_id UUID NOT NULL REFERENCES sdr_messages(id) ON DELETE CASCADE,
   reason TEXT NOT NULL,
+  classifier_guess TEXT,
+  classifier_confidence DOUBLE PRECISION,
   status TEXT NOT NULL DEFAULT 'open',
-  resolved_by UUID,
-  resolution_note TEXT,
-  resolved_at TIMESTAMPTZ,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS sdr_review_queue_org_idx ON sdr_review_queue(organization_id);
-CREATE INDEX IF NOT EXISTS sdr_review_queue_org_status_idx ON sdr_review_queue(organization_id, status);
-CREATE INDEX IF NOT EXISTS sdr_review_queue_org_scope_idx ON sdr_review_queue(organization_id, scope, status);
-CREATE INDEX IF NOT EXISTS sdr_review_queue_reply_idx ON sdr_review_queue(reply_id);
-
--- F1-008: Calendar Booking + Pre-Meeting Brief.
--- The handoff point buyers actually want — the founder takes over ONLY once a
--- meeting is booked. One row per prospect meeting, tenant-scoped by
--- organization_id. status walks proposed → confirmed → (held | no_show |
--- cancelled). proposed_slots holds the three freebusy-clear slots we offered in
--- the prospect's timezone; starts_at/ends_at are the single slot the prospect
--- confirmed; calendar_event_id + meet_link come back from Google Calendar after
--- the event is created with conferenceData. proposal_message_id /
--- confirmation_message_id link the outbound sdr_messages the agent sent.
--- Free-form text columns carry NO CHECK constraint (enum values enforced in app).
-CREATE TABLE IF NOT EXISTS sdr_meetings (
-  id UUID PRIMARY KEY,
-  organization_id UUID NOT NULL,
-  prospect_id UUID REFERENCES sdr_prospects(id) ON DELETE SET NULL,
-  reply_id UUID REFERENCES sdr_replies(id) ON DELETE SET NULL,
-  campaign_id UUID REFERENCES sdr_campaigns(id) ON DELETE SET NULL,
-  mailbox_id UUID,
-  calendar_event_id TEXT,
-  meet_link TEXT,
-  starts_at TIMESTAMPTZ,
-  ends_at TIMESTAMPTZ,
-  timezone TEXT NOT NULL DEFAULT 'UTC',
-  status TEXT NOT NULL DEFAULT 'proposed',
-  proposed_slots JSONB NOT NULL DEFAULT '[]'::jsonb,
-  proposal_message_id UUID,
-  confirmation_message_id UUID,
-  referral_prompted_at TIMESTAMPTZ,
-  last_error TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  resolved_at TIMESTAMPTZ
 );
 
-CREATE INDEX IF NOT EXISTS sdr_meetings_org_idx ON sdr_meetings(organization_id);
-CREATE INDEX IF NOT EXISTS sdr_meetings_org_status_idx ON sdr_meetings(organization_id, status);
-CREATE INDEX IF NOT EXISTS sdr_meetings_org_starts_idx ON sdr_meetings(organization_id, starts_at);
-CREATE INDEX IF NOT EXISTS sdr_meetings_prospect_idx ON sdr_meetings(prospect_id);
-CREATE UNIQUE INDEX IF NOT EXISTS sdr_meetings_prospect_active_uniq
-  ON sdr_meetings(prospect_id)
-  WHERE status IN ('proposed', 'confirmed');
+CREATE INDEX IF NOT EXISTS sdr_review_queue_org_status_idx
+  ON sdr_review_queue(organization_id, status, created_at ASC);
+CREATE INDEX IF NOT EXISTS sdr_review_queue_message_idx
+  ON sdr_review_queue(message_id);
 
--- F1-008: the pre-meeting brief. Composed from the prospect's Apollo record +
--- 1-5 sdr_prospect_signals + the thread summary, delivered via @nexus/notifications
--- 12 hours before starts_at. brief_markdown is the magazine-style body rendered on
--- /meetings/[id]; headline + what_to_say_first are the structured callouts the UI
--- surfaces. delivered_at is stamped when the 12h-before notification fires.
-CREATE TABLE IF NOT EXISTS sdr_meeting_briefs (
+CREATE TABLE IF NOT EXISTS sdr_review_decisions (
   id UUID PRIMARY KEY,
   organization_id UUID NOT NULL,
-  meeting_id UUID NOT NULL REFERENCES sdr_meetings(id) ON DELETE CASCADE,
-  prospect_id UUID REFERENCES sdr_prospects(id) ON DELETE SET NULL,
-  headline TEXT,
-  brief_markdown TEXT NOT NULL,
-  what_to_say_first TEXT,
-  signal_count INTEGER NOT NULL DEFAULT 0,
-  source TEXT NOT NULL DEFAULT 'fallback',
-  generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  delivered_at TIMESTAMPTZ,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  review_id UUID NOT NULL REFERENCES sdr_review_queue(id) ON DELETE CASCADE,
+  operator_id UUID NOT NULL,
+  corrected_classification TEXT NOT NULL,
+  action TEXT NOT NULL,
+  notes TEXT,
+  decided_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS sdr_meeting_briefs_org_idx ON sdr_meeting_briefs(organization_id);
-CREATE UNIQUE INDEX IF NOT EXISTS sdr_meeting_briefs_meeting_uniq ON sdr_meeting_briefs(meeting_id);
-CREATE INDEX IF NOT EXISTS sdr_meeting_briefs_prospect_idx ON sdr_meeting_briefs(prospect_id);
+CREATE INDEX IF NOT EXISTS sdr_review_decisions_org_idx
+  ON sdr_review_decisions(organization_id, decided_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS sdr_review_decisions_review_uniq
+  ON sdr_review_decisions(review_id);
 `;
